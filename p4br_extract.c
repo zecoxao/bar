@@ -3,9 +3,11 @@
  *
  * Multithreaded native-Windows C port of p4br_extract.py.
  *
- * Build (from WSL, mingw64 cross compiler -> native .exe):
- *   x86_64-w64-mingw32-gcc -O3 -maes -msse4.1 -municode \
- *       p4br_extract.c -o p4br_extract.exe
+ * Build (mingw64 -> native .exe):
+ *   x86_64-w64-mingw32-gcc -O3 -maes -msse4.1 p4br_extract.c -o p4br_extract.exe
+ *
+ * HMAC-SHA256 verification of the header and every segment runs before
+ * extraction by default (obligatory); disable it with --verify false.
  *
  * Differences from the Python reference (all improvements, output identical):
  *   - Segments are decrypted with CBC random-access, a bounded window at a
@@ -41,6 +43,9 @@
 static const char CAF_MAGIC[8]  = { 'S','C','E','C','A','F',0,0 };
 static const char P4BR_MAGIC[4] = { 'P','4','B','R' };
 static const char *DEFAULT_KEY  = "101851B22B669178970C5459B3CB8D45";
+/* HMAC-SHA256 key for the per-segment / header signatures (new keyset). */
+static const char *DEFAULT_HASH_KEY =
+    "184FBFBB6DC61433C7A5BD8259C1C21FFEC0ECBEC4319805EE0693869152EB52";
 
 /* ===================================================================== */
 /* AES-128 : AES-NI primary, software fallback                           */
@@ -268,6 +273,107 @@ static void cbc_dec_blocks(const aes_ctx *c, const uint8_t *ct, size_t nblocks,
         }
         memcpy(iv, prev, 16);
     }
+}
+
+/* ===================================================================== */
+/* SHA-256 + HMAC-SHA256 (self-contained, used by --verify)              */
+/* ===================================================================== */
+
+typedef struct { uint32_t h[8]; uint64_t bits; uint8_t buf[64]; size_t n; } sha256_t;
+
+static const uint32_t SHA_K[64] = {
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+
+#define SHR(x,n)  ((x) >> (n))
+#define ROTR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static void sha256_blk(sha256_t *c, const uint8_t *p)
+{
+    uint32_t w[64], a,b,cc,d,e,f,g,h,t1,t2;
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|((uint32_t)p[i*4+2]<<8)|p[i*4+3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ROTR(w[i-15],7) ^ ROTR(w[i-15],18) ^ SHR(w[i-15],3);
+        uint32_t s1 = ROTR(w[i-2],17) ^ ROTR(w[i-2],19) ^ SHR(w[i-2],10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        t1 = h + S1 + ch + SHA_K[i] + w[i];
+        uint32_t S0 = ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22);
+        uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+        t2 = S0 + maj;
+        h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+
+static void sha256_init(sha256_t *c)
+{
+    c->h[0]=0x6a09e667;c->h[1]=0xbb67ae85;c->h[2]=0x3c6ef372;c->h[3]=0xa54ff53a;
+    c->h[4]=0x510e527f;c->h[5]=0x9b05688c;c->h[6]=0x1f83d9ab;c->h[7]=0x5be0cd19;
+    c->bits=0;c->n=0;
+}
+
+static void sha256_update(sha256_t *c, const uint8_t *p, size_t len)
+{
+    c->bits += (uint64_t)len * 8;
+    while (len) {
+        size_t take = 64 - c->n; if (take > len) take = len;
+        memcpy(c->buf + c->n, p, take);
+        c->n += take; p += take; len -= take;
+        if (c->n == 64) { sha256_blk(c, c->buf); c->n = 0; }
+    }
+}
+
+static void sha256_final(sha256_t *c, uint8_t out[32])
+{
+    uint64_t bits = c->bits;
+    uint8_t pad = 0x80;
+    sha256_update(c, &pad, 1);
+    uint8_t z = 0;
+    while (c->n != 56) sha256_update(c, &z, 1);
+    uint8_t lb[8];
+    for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bits >> (56 - i*8));
+    sha256_update(c, lb, 8);
+    for (int i = 0; i < 8; i++) {
+        out[i*4]   = (uint8_t)(c->h[i] >> 24);
+        out[i*4+1] = (uint8_t)(c->h[i] >> 16);
+        out[i*4+2] = (uint8_t)(c->h[i] >> 8);
+        out[i*4+3] = (uint8_t)(c->h[i]);
+    }
+}
+
+typedef struct { sha256_t in, out; } hmac256_t;
+
+static void hmac256_init(hmac256_t *h, const uint8_t *key, size_t klen)
+{
+    uint8_t k[64], ki[64], ko[64], kh[32];
+    if (klen > 64) { sha256_t t; sha256_init(&t); sha256_update(&t,key,klen); sha256_final(&t,kh); key=kh; klen=32; }
+    memset(k, 0, 64); memcpy(k, key, klen);
+    for (int i = 0; i < 64; i++) { ki[i] = k[i]^0x36; ko[i] = k[i]^0x5c; }
+    sha256_init(&h->in);  sha256_update(&h->in, ki, 64);
+    sha256_init(&h->out); sha256_update(&h->out, ko, 64);
+}
+
+static void hmac256_update(hmac256_t *h, const uint8_t *p, size_t len)
+{ sha256_update(&h->in, p, len); }
+
+static void hmac256_final(hmac256_t *h, uint8_t out[32])
+{
+    uint8_t ih[32];
+    sha256_final(&h->in, ih);
+    sha256_update(&h->out, ih, 32);
+    sha256_final(&h->out, out);
 }
 
 /* ===================================================================== */
@@ -685,13 +791,53 @@ static void detect_aesni(void)
     build_rsbox();   /* always, in case fallback is used */
 }
 
+/* ===================================================================== */
+/* --verify : per-segment + header HMAC-SHA256                           */
+/* ===================================================================== */
+
+/* HMAC-SHA256 over a segment's raw ciphertext (data_size_without_padding
+ * bytes at seg->off), streamed through a bounded window. `base` is an
+ * hmac256_t whose key has already been absorbed. */
+static void hmac_segment_ct(archive_t *ar, const hmac256_t *base,
+                            const segment_t *seg, uint8_t *rbuf, uint8_t out[32])
+{
+    hmac256_t h = *base;
+    uint64_t left = seg->nopad, pos = seg->off;
+    while (left) {
+        uint64_t want = left < BUFCAP ? left : BUFCAP;
+        uint64_t got = archive_read(ar, pos, want, rbuf);
+        if (got == 0) break;
+        hmac256_update(&h, rbuf, (size_t)got);
+        pos += got; left -= got;
+    }
+    hmac256_final(&h, out);
+}
+
+/* HMAC-SHA256 over the plaintext header region file[0:hsize]. */
+static void hmac_header(archive_t *ar, const hmac256_t *base,
+                        uint64_t hsize, uint8_t *rbuf, uint8_t out[32])
+{
+    hmac256_t h = *base;
+    uint64_t left = hsize, pos = 0;
+    while (left) {
+        uint64_t want = left < BUFCAP ? left : BUFCAP;
+        uint64_t got = archive_read(ar, pos, want, rbuf);
+        if (got == 0) break;
+        hmac256_update(&h, rbuf, (size_t)got);
+        pos += got; left -= got;
+    }
+    hmac256_final(&h, out);
+}
+
 int main(int argc, char **argv)
 {
     const char *backup = NULL, *outdir = "restore", *keyhex = DEFAULT_KEY;
+    const char *hashhex = DEFAULT_HASH_KEY;
     const char *manifest = NULL;
     char *inc[64]; int ninc = 0;
     char *exc[64]; int nexc = 0;
     int do_list = 0;
+    int verify = 1;              /* obligatory by default; --verify false disables */
     uint64_t max_bytes = 0;
     int nthreads = 0;
 
@@ -699,24 +845,38 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (!strcmp(a,"-o")||!strcmp(a,"--out"))        outdir   = argv[++i];
         else if (!strcmp(a,"-k")||!strcmp(a,"--key"))   keyhex   = argv[++i];
+        else if (!strcmp(a,"-H")||!strcmp(a,"--hash-key")) hashhex = argv[++i];
         else if (!strcmp(a,"--include"))                { if (ninc<64) inc[ninc++]=argv[++i]; else i++; }
         else if (!strcmp(a,"--exclude"))                { if (nexc<64) exc[nexc++]=argv[++i]; else i++; }
         else if (!strcmp(a,"--list"))                   do_list = 1;
         else if (!strcmp(a,"--manifest"))               manifest = argv[++i];
         else if (!strcmp(a,"--max-bytes"))              max_bytes = strtoull(argv[++i],NULL,0);
         else if (!strcmp(a,"-j")||!strcmp(a,"--threads")) nthreads = atoi(argv[++i]);
-        else if (!strcmp(a,"--verify")) { fprintf(stderr,"--verify is not ported to the C tool\n"); return 2; }
+        else if (!strcmp(a,"--verify")) {
+            /* optional boolean argument; default true */
+            const char *v = (i+1 < argc) ? argv[i+1] : NULL;
+            if (v && (!strcmp(v,"false")||!strcmp(v,"0")||!strcmp(v,"no")||!strcmp(v,"off")))  { verify = 0; i++; }
+            else if (v && (!strcmp(v,"true")||!strcmp(v,"1")||!strcmp(v,"yes")||!strcmp(v,"on"))) { verify = 1; i++; }
+            else verify = 1;
+        }
         else if (a[0]=='-') { fprintf(stderr,"unknown option: %s\n",a); return 2; }
         else backup = a;
     }
     if (!backup) { fprintf(stderr,
-        "usage: p4br_extract <backup_dir> [-o out] [-k hexkey] [--include P]...\n"
-        "                    [--exclude P]... [--list] [--manifest F]\n"
-        "                    [--max-bytes N] [-j threads]\n"); return 2; }
+        "usage: p4br_extract <backup_dir> [-o out] [-k hexkey] [-H hashkey]\n"
+        "                    [--include P]... [--exclude P]... [--list]\n"
+        "                    [--verify true|false] [--manifest F] [--max-bytes N] [-j threads]\n"
+        "\n"
+        "HMAC-SHA256 verification of the header and every segment runs before\n"
+        "extraction by default (obligatory); disable it with --verify false.\n"); return 2; }
 
     uint8_t key[16];
     if (strlen(keyhex) != 32 || hex2bin(keyhex, key, 16) != 0) {
         fprintf(stderr, "key must be 16 bytes (32 hex chars)\n"); return 2;
+    }
+    uint8_t hkey[32];
+    if (strlen(hashhex) != 64 || hex2bin(hashhex, hkey, 32) != 0) {
+        fprintf(stderr, "hash key must be 32 bytes (64 hex chars)\n"); return 2;
     }
 
     detect_aesni();
@@ -814,6 +974,57 @@ int main(int argc, char **argv)
     if (cum != pr_total)
         printf("[!] warning: catalog payload 0x%llx != segment payload 0x%llx\n",
                (unsigned long long)cum, (unsigned long long)pr_total);
+
+    /* ----- obligatory HMAC-SHA256 verification (header + every segment) ----- */
+    if (verify && !do_list) {
+        hmac256_t base; hmac256_init(&base, hkey, 32);
+        uint64_t hsize    = 0x30 + 0x40 * nseg + 0x30 * nseg;
+        uint64_t sig_base = 0x30 + 0x40 * nseg;
+        uint8_t calc[32], want[32];
+
+        archive_read(&ar, hsize, 0x20, want);
+        hmac_header(&ar, &base, hsize, rbuf, calc);
+        int hdr_ok = (memcmp(calc, want, 32) == 0);
+        printf("[+] HMAC header signature: %s\n", hdr_ok ? "OK" : "MISMATCH");
+
+        int bad = 0, empty = 0, checked = 0;
+        for (uint64_t i = 0; i < nseg; i++) {
+            if (segs[i].nopad == 0) { empty++; continue; }  /* empty seg: placeholder sig */
+            uint8_t sig[48];
+            archive_read(&ar, sig_base + 48 * i, 48, sig);
+            hmac_segment_ct(&ar, &base, &segs[i], rbuf, calc);
+            checked++;
+            if (memcmp(calc, sig + 8, 32) != 0) {
+                bad++;
+                const char *label = "?";
+                char lbuf[300];
+                if ((int)i < seg_start) {
+                    const char *names[3] = { "P4BR header", "dir catalog", "file catalog" };
+                    label = (i < 3) ? names[i] : "aux metadata";
+                } else {
+                    uint64_t p0 = prefix[i - (uint64_t)seg_start];
+                    uint64_t p1 = p0 + segs[i].nopad;
+                    int first = -1, hits = 0;
+                    for (int f = 0; f < nfile_rec; f++) {
+                        uint64_t a0 = cums[f], a1 = cums[f] + files[f].size;
+                        if (a0 < p1 && a1 > p0) { if (first < 0) first = f; hits++; }
+                    }
+                    if (first >= 0) {
+                        if (hits > 1) { snprintf(lbuf, sizeof lbuf, "%s (+%d more)", files[first].path, hits - 1); label = lbuf; }
+                        else label = files[first].path;
+                    }
+                }
+                printf("  BAD  seg[%llu] index=%llu nopad=0x%llx -> %s\n",
+                       (unsigned long long)i, (unsigned long long)segs[i].index,
+                       (unsigned long long)segs[i].nopad, label);
+            }
+        }
+        printf("[+] segment HMAC: %d/%d OK, %d bad, %d empty (placeholder)\n",
+               checked - bad, checked, bad, empty);
+        int ok = hdr_ok && !bad;
+        printf("%s\n", ok ? "[+] verification PASSED"
+                          : "[!] verification FAILED -- extracting anyway (data may be corrupt)");
+    }
 
     filter_t filt = { inc, ninc, exc, nexc };
 

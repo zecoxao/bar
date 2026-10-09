@@ -44,13 +44,8 @@ P4BR_MAGIC= b"P4BR"
 # --- NEW SBL BAR cipher key (replaces the old 79c8ccc8... key in bar.c) ---
 DEFAULT_KEY = "101851B22B669178970C5459B3CB8D45"
 
-# HMAC-SHA256 key for per-segment signatures (unchanged from bar.c sbl_bar_hash_key)
-HASH_KEY = bytes([
-    0x1f, 0x18, 0xc9, 0x70, 0xd0, 0x00, 0xac, 0x7e,
-    0x6f, 0xcc, 0x1a, 0x8c, 0xdd, 0x89, 0xb4, 0xfe,
-    0xcd, 0xa1, 0x33, 0xa1, 0x0e, 0xc8, 0xf5, 0x25,
-    0x98, 0x22, 0x23, 0xf5, 0x86, 0x1f, 0x02, 0x00,
-])
+# HMAC-SHA256 key for the per-segment / header signatures (new keyset).
+DEFAULT_HASH_KEY = "184FBFBB6DC61433C7A5BD8259C1C21FFEC0ECBEC4319805EE0693869152EB52"
 
 
 class Archive:
@@ -240,6 +235,7 @@ def main():
     ap.add_argument("backup", help="path to backup folder containing archive.dat")
     ap.add_argument("-o", "--out", default="restore", help="output directory (default: ./restore)")
     ap.add_argument("-k", "--key", default=DEFAULT_KEY, help="AES-128 cipher key (hex)")
+    ap.add_argument("-H", "--hash-key", default=DEFAULT_HASH_KEY, help="HMAC-SHA256 hash key (hex)")
     ap.add_argument("--include", action="append", default=[],
                     help="only extract paths starting with this prefix (repeatable), e.g. /system_data /user/home")
     ap.add_argument("--exclude", action="append", default=[],
@@ -326,73 +322,48 @@ def main():
         return
 
     if args.verify:
-        import hmac, hashlib, json
-        sigs = read_segment_signatures(ar, meta["num_segments"])
-        # Calibrate the HMAC hash key on seg0 (the P4BR header, known-good content).
-        seg0_plain = decrypt_segment(ar, key, segs[0])
-        hmac_ok = hmac.new(HASH_KEY, seg0_plain, hashlib.sha256).digest() == sigs[0]
-        if hmac_ok:
-            print("[+] HMAC hash key matches this keyset; running full per-segment HMAC verify")
-            cum = 0
-            franges = []
-            for p, s, m, t in files:
-                franges.append((cum, cum + s, p)); cum += s
-            payload_base = sum(s.nopad for s in segs[:seg_start])
-            bad = 0; t0 = time.time()
-            for i, seg in enumerate(segs):
-                plain = decrypt_segment(ar, key, seg)
-                if hmac.new(HASH_KEY, plain, hashlib.sha256).digest() != sigs[i]:
-                    bad += 1
-                    if i >= seg_start:
-                        p0 = sum(s.nopad for s in segs[:i]) - payload_base
-                        hit = [fp for (a, b, fp) in franges if a < p0 + seg.nopad and b > p0]
-                        label = (hit[0] + (f" (+{len(hit)-1} more)" if len(hit) > 1 else "")) if hit else "?"
-                    else:
-                        label = ["P4BR header", "dir catalog", "file catalog"][i] if i < 3 else "aux metadata"
-                    print(f"  BAD seg[{i}] idx={seg.index} nopad={seg.nopad:#x} -> {label}")
-                if (i % 50) == 0:
-                    print(f"  ... {i}/{meta['num_segments']} segments, {bad} bad", flush=True)
-            ar.close()
-            print(f"[+] verify done: {bad} bad / {meta['num_segments']} segments in {time.time()-t0:.0f}s")
-            return
-        # Fallback: the bar.c hash key does not apply to this (new) keyset, so HMAC
-        # cannot be checked. Do a content/magic sanity check on files with known
-        # signatures -- this is what actually catches corruption in practice.
-        print("[!] HMAC hash key does NOT match this keyset -- per-segment HMAC verify unavailable.")
-        print("[!] falling back to content/magic sanity check on known file types.")
-        pr = PayloadReader(ar, key, segs, seg_start)
-        cum = 0; cums = []
+        import hmac, hashlib
+        hkey = bytes.fromhex(args.hash_key)
+        if len(hkey) != 32:
+            sys.exit("hash key must be 32 bytes (AES/HMAC-SHA256)")
+        ns = meta["num_segments"]
+        sigs = read_segment_signatures(ar, ns)
+
+        # header signature: HMAC-SHA256 over file[0:header_size], stored right after
+        header_size = 0x30 + 0x40 * ns + 0x30 * ns
+        stored = ar.read(header_size, 0x20)
+        calc = hmac.new(hkey, ar.read(0, header_size), hashlib.sha256).digest()
+        hdr_ok = (calc == stored)
+        print(f"[+] HMAC header signature: {'OK' if hdr_ok else 'MISMATCH'}")
+
+        # per-segment: HMAC-SHA256 over the raw ciphertext (nopad bytes)
+        cum = 0
+        franges = []
         for p, s, m, t in files:
-            cums.append(cum); cum += s
-        MAGICS = {".sfo": b"\x00PSF", ".db": b"SQLite format 3\x00",
-                  ".png": b"\x89PNG\r\n\x1a\n", ".sfo.backup": b"\x00PSF"}
-        checked = bad = 0
+            franges.append((cum, cum + s, p)); cum += s
+        payload_base = sum(s.nopad for s in segs[:seg_start])
+        bad = empty = checked = 0
         t0 = time.time()
-        for idx, (path, size, mode, mtime) in enumerate(files):
-            if size == 0:
+        for i, seg in enumerate(segs):
+            if seg.nopad == 0:
+                empty += 1          # empty segment carries a constant placeholder sig
                 continue
-            low = path.lower()
-            mag = next((m for ext, m in MAGICS.items() if low.endswith(ext)), None)
-            if not mag or size < len(mag):
-                continue
-            head = pr.read(cums[idx], len(mag))
+            ct = ar.read(seg.off, seg.nopad)
             checked += 1
-            if head != mag:
+            if hmac.new(hkey, ct, hashlib.sha256).digest() != sigs[i]:
                 bad += 1
-                print(f"  BAD magic {path}: expected {mag!r} got {head!r}")
-            # JSON files: try to parse the whole thing
-        # separately validate a few JSON files
-        for idx, (path, size, mode, mtime) in enumerate(files):
-            if path.lower().endswith(".json") and 0 < size < (1 << 20):
-                checked += 1
-                try:
-                    json.loads(pr.read(cums[idx], size).decode("utf-8-sig", "strict"))
-                except Exception as e:
-                    bad += 1
-                    print(f"  BAD json  {path}: {e}")
+                if i >= seg_start:
+                    p0 = sum(s.nopad for s in segs[seg_start:i])
+                    hit = [fp for (a, b, fp) in franges if a < p0 + seg.nopad and b > p0]
+                    label = (hit[0] + (f" (+{len(hit)-1} more)" if len(hit) > 1 else "")) if hit else "?"
+                else:
+                    label = ["P4BR header", "dir catalog", "file catalog"][i] if i < 3 else "aux metadata"
+                print(f"  BAD  seg[{i}] index={seg.index} nopad={seg.nopad:#x} -> {label}")
         ar.close()
-        print(f"[+] sanity check done: {checked} files checked, {bad} failed, in {time.time()-t0:.0f}s")
-        return
+        print(f"[+] segment HMAC: {checked-bad}/{checked} OK, {bad} bad, {empty} empty (placeholder)")
+        ok = hdr_ok and not bad
+        print(f"[+] verification {'PASSED' if ok else 'FAILED'} in {time.time()-t0:.0f}s")
+        sys.exit(0 if ok else 1)
 
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
