@@ -735,6 +735,30 @@ static int caf_read_seg(const wchar_t *dir, uint32_t want_index, uint8_t **out, 
     return rc;
 }
 
+/* find a 0-byte segment in the template and copy its placeholder signature. */
+static int caf_empty_sig(const wchar_t *dir, uint8_t out[32])
+{
+    uint8_t hdr[0x30];
+    if (caf_pread(dir, 0, 0x30, hdr) != 0) return -1;
+    if (memcmp(hdr, CAF_MAGIC, 6) != 0) return -2;
+    uint64_t nseg; memcpy(&nseg, hdr + 0x18, 8);
+    if (nseg == 0 || nseg > 2000000) return -3;
+    uint8_t *tbl = malloc((size_t)(0x40*nseg));
+    if (caf_pread(dir, 0x30, 0x40*nseg, tbl) != 0) { free(tbl); return -1; }
+    uint64_t sigbase = 0x30 + 0x40*nseg;
+    int rc = -4;
+    for (uint64_t i = 0; i < nseg; i++) {
+        uint64_t nopad; memcpy(&nopad, tbl + 0x40*i + 0x38, 8);
+        if (nopad == 0) {
+            uint8_t ent[0x30];
+            if (caf_pread(dir, sigbase + 0x30*i, 0x30, ent) == 0) { memcpy(out, ent + 8, 32); rc = 0; }
+            break;
+        }
+    }
+    free(tbl);
+    return rc;
+}
+
 /* strip the trailing \archive.dat (or \archiveNNNN.dat) to get the dir */
 static void dir_of_archive(const char *archive_path, wchar_t *wdir, int cap)
 {
@@ -961,11 +985,21 @@ static uint64_t src_read(src_t *s, uint8_t *dst, uint64_t n)
 /* Encrypt `L` plaintext bytes from src with IV=seed, write ciphertext at
  * archive offset `off`, zero-pad the segment to `pad`, and HMAC the
  * ciphertext (nopad bytes). Fills seg->sig. */
+/* empty (0-byte) segments carry a CONSTANT placeholder signature in real
+ * backups, not an HMAC. We capture it from the template at runtime. */
+static uint8_t g_empty_sig[32];
+static int     g_have_empty_sig = 0;
+
 static int seal_segment(writer_t *w, const aes_ctx *c, const hmac256_t *hbase,
                         src_t *src, seg_out_t *seg,
                         uint8_t *inbuf, uint8_t *outbuf)
 {
     uint64_t L = seg->nopad;
+    if (L == 0) {                       /* empty segment: no data, placeholder sig */
+        if (g_have_empty_sig) memcpy(seg->sig, g_empty_sig, 32);
+        else { hmac256_t hm = *hbase; hmac256_final(&hm, seg->sig); }
+        return 0;
+    }
     uint64_t full = L - (L % 16);
     uint8_t iv[16]; memcpy(iv, seg->seed, 16);
     uint8_t lastct[16]; memcpy(lastct, seg->seed, 16);
@@ -1126,6 +1160,7 @@ static int run_create(const create_job_t *J)
                 rg_free(&R);
                 seg4buf=s4; seg4len=l4; seg5buf=s5; seg5len=l5; p4tmpl=s0; p4tmpllen=l0;
                 have_aux = 1;
+                g_have_empty_sig = (caf_empty_sig(tdir, g_empty_sig) == 0);  /* placeholder for 0-byte files */
                 printf("[+] aux from template %s : seg3=0x%llx seg4=0x%llx seg5=0x%llx (template keyset=%s)\n",
                        J->tmpl, (unsigned long long)RG_BLOB,
                        (unsigned long long)seg4len, (unsigned long long)seg5len,
@@ -1182,12 +1217,14 @@ static int run_create(const create_job_t *J)
     uint64_t off = file_offset;
     for (uint64_t i = 0; i < nseg; i++) {
         segs[i].pad = pad_of(segs[i].nopad);
-        segs[i].off = off;
+        segs[i].off = segs[i].nopad ? off : 0x200000;   /* empty seg uses sentinel offset */
         off += segs[i].pad;
         segs[i].index = (i < naux) ? (i + 1) : (10000 + (i - naux));  /* payload base = 10000 (decimal) */
         rand_seed(segs[i].seed);
     }
-    uint64_t file_size = 0; for (uint64_t i=0;i<nseg;i++) file_size += segs[i].nopad;
+    /* file_size = size of the data region = sum of PADDED segments
+     * (== archive length - file_offset); the console checks this. */
+    uint64_t file_size = 0; for (uint64_t i=0;i<nseg;i++) file_size += segs[i].pad;
 
     writer_t w; writer_init(&w, wout);
 
