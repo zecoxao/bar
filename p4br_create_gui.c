@@ -1062,6 +1062,7 @@ typedef struct {
     char  sets[MAX_SETS][160]; /* generic KEYIDHEX=string overlays */
     int   nsets;
     char  keyset[8];         /* "old" | "new" (force); default follows template */
+    int   clone;             /* reproduce -t template byte-for-byte (diagnostic) */
 } create_job_t;
 
 /* friendly registry key IDs (PS4 regmgr) */
@@ -1096,8 +1097,96 @@ static void human(uint64_t n, char *out)
     sprintf(out, "%.1f%s", v, u[i]);
 }
 
+/* ===================================================================== */
+/* clone mode: reproduce a template archive.dat byte-for-byte             */
+/*   Re-encrypts the template's own segments with the template's own      */
+/*   seeds + table + catalog, recomputing every HMAC with our code, so a  */
+/*   correct writer yields output == template. A diagnostic / correctness */
+/*   test: if even this restores as "corrupted", the template itself is   */
+/*   not restorable by the console (our generation is not the cause).     */
+/* ===================================================================== */
+static int run_clone(const create_job_t *J)
+{
+    detect_aesni();
+    wchar_t tdir[MAX_PATH*2]; dir_of_archive(J->tmpl, tdir, MAX_PATH*2);
+    uint8_t h0[0x30];
+    if (caf_pread(tdir, 0, 0x30, h0) != 0 || memcmp(h0, CAF_MAGIC, 6) != 0) { fprintf(stderr,"clone: bad template\n"); return 1; }
+    uint64_t nseg; memcpy(&nseg, h0 + 0x18, 8);
+    uint64_t foff; memcpy(&foff, h0 + 0x20, 8);
+    if (!nseg || nseg > 2000000) { fprintf(stderr,"clone: bad nseg\n"); return 1; }
+    uint8_t *tbl = malloc((size_t)(0x40*nseg));
+    uint64_t hdr_size = 0x30 + 0x40*nseg + 0x30*nseg;
+    uint8_t *sigtbl = malloc((size_t)(0x30*nseg));
+    if (caf_pread(tdir, 0x30, 0x40*nseg, tbl) != 0 ||
+        caf_pread(tdir, 0x30 + 0x40*nseg, 0x30*nseg, sigtbl) != 0) { fprintf(stderr,"clone: short read\n"); return 1; }
+
+    /* detect keyset from the P4BR segment (index 1) */
+    uint8_t nkey[16], okey[16]; hex2bin(DEFAULT_KEY, nkey, 16); hex2bin(OLD_KEY_HEX, okey, 16);
+    uint8_t nhk[32], ohk[32]; hex2bin(DEFAULT_HASH_KEY, nhk, 32); hex2bin(OLD_HASH_KEY_HEX, ohk, 32);
+    aes_ctx kc; const uint8_t *ck=NULL, *hk=NULL;
+    for (uint64_t i = 0; i < nseg; i++) {
+        uint8_t *r = tbl + 0x40*i; uint64_t idx; memcpy(&idx, r, 8); if (idx != 1) continue;
+        uint64_t off,nop; memcpy(&off,r+8,8); memcpy(&nop,r+0x38,8); uint8_t seed[16]; memcpy(seed,r+0x28,16);
+        if (!nop || nop > 0x4000) break;
+        uint8_t *ct = malloc((size_t)nop), head[16];
+        if (caf_pread(tdir, off, nop, ct) == 0) {
+            for (int t=0;t<2;t++){ aes_setup(&kc, t?okey:nkey); cbc_dec_cts(&kc,seed,ct,(nop<16?nop:16),head);
+                if (memcmp(head,P4BR_MAGIC,4)==0){ ck=t?okey:nkey; hk=t?ohk:nhk; break; } }
+        }
+        free(ct); break;
+    }
+    if (!ck) { fprintf(stderr,"clone: could not detect keyset\n"); return 1; }
+    aes_setup(&kc, ck);
+    hmac256_t hbase; hmac256_init(&hbase, hk, 32);
+    g_have_empty_sig = (caf_empty_sig(tdir, g_empty_sig) == 0);
+
+    wchar_t *wout = utf8_to_wide(J->outdir[0] ? J->outdir : "clone_out");
+    CreateDirectoryW(wout, NULL);
+    writer_t w; writer_init(&w, wout);
+    printf("[+] clone %s : nseg=%llu keyset=%s%s\n", J->tmpl, (unsigned long long)nseg,
+           ck==nkey?"new":"old", g_aesni?"  [AES-NI]":"");
+
+    uint8_t *ib=_aligned_malloc(BUFCAP,16), *ob=_aligned_malloc(BUFCAP,16);
+    uint8_t *hdrbuf = calloc(1,(size_t)hdr_size);
+    memcpy(hdrbuf, h0, 0x30);                 /* SCECAF header verbatim */
+    memcpy(hdrbuf+0x30, tbl, 0x40*nseg);      /* segment table verbatim */
+    uint8_t *osig = hdrbuf + 0x30 + 0x40*nseg;
+    memcpy(osig, sigtbl, 0x30*nseg);          /* sig lead/trailer verbatim; sig recomputed below */
+
+    for (uint64_t i = 0; i < nseg; i++) {
+        uint8_t *r = tbl + 0x40*i;
+        uint64_t off,pad,nop; memcpy(&off,r+8,8); memcpy(&pad,r+0x10,8); memcpy(&nop,r+0x38,8);
+        uint8_t seed[16]; memcpy(seed,r+0x28,16);
+        seg_out_t sg; memset(&sg,0,sizeof sg); sg.off=off; sg.pad=pad; sg.nopad=nop; memcpy(sg.seed,seed,16);
+        if (nop) {
+            uint8_t *ct=malloc((size_t)nop), *pt=malloc((size_t)nop);
+            if (caf_pread(tdir, off, nop, ct)!=0){ fprintf(stderr,"clone: read seg %llu\n",(unsigned long long)i); return 1; }
+            cbc_dec_cts(&kc, seed, ct, nop, pt); free(ct);
+            src_t s={pt,NULL,nop}; seal_segment(&w,&kc,&hbase,&s,&sg,ib,ob); free(pt);
+        } else {
+            src_t es={NULL,NULL,0}; seal_segment(&w,&kc,&hbase,&es,&sg,ib,ob);  /* empty: placeholder */
+        }
+        memcpy(osig + 0x30*i + 8, sg.sig, 32);   /* our recomputed HMAC into verbatim entry */
+    }
+    writer_write(&w, 0, hdrbuf, hdr_size);
+    uint8_t hh[32]; hmac256_t hm=hbase; hmac256_update(&hm,hdrbuf,(size_t)hdr_size); hmac256_final(&hm,hh);
+    writer_write(&w, hdr_size, hh, 32);
+    uint64_t gap = foff - (hdr_size+32);
+    if ((int64_t)gap > 0) { uint8_t *z=calloc(1,(size_t)(gap>BUFCAP?BUFCAP:gap)); uint64_t p=hdr_size+32;
+        while(gap){ uint64_t wn=gap>BUFCAP?BUFCAP:gap; writer_write(&w,p,z,wn); p+=wn; gap-=wn; } free(z); }
+    _aligned_free(ib); _aligned_free(ob); free(hdrbuf); free(tbl); free(sigtbl);
+    writer_close(&w); free(wout);
+    printf("[+] clone done -> %s  (diff it against the template; should be identical)\n",
+           J->outdir[0]?J->outdir:"clone_out");
+    return 0;
+}
+
 static int run_create(const create_job_t *J)
 {
+    if (J->clone) {
+        if (!J->tmpl[0]) { fprintf(stderr,"--clone needs -t <template archive.dat>\n"); return 2; }
+        return run_clone(J);
+    }
     const char *keyhex  = J->keyhex[0]  ? J->keyhex  : DEFAULT_KEY;
     const char *hashhex = J->hashhex[0] ? J->hashhex : DEFAULT_HASH_KEY;
 
@@ -1420,6 +1509,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         else if (!strcmp(a,"--openpsid"))               { if(++i<argc) strncpy(J->openpsid,argv[i],sizeof J->openpsid-1); }
         else if (!strcmp(a,"--set"))                    { if(++i<argc && J->nsets<MAX_SETS) strncpy(J->sets[J->nsets++],argv[i],159); }
         else if (!strcmp(a,"--keyset"))                 { if(++i<argc) strncpy(J->keyset,argv[i],sizeof J->keyset-1); }
+        else if (!strcmp(a,"--clone"))                  { J->clone = 1; }
         else if (!strcmp(a,"--gui"))                    { /* handled in main */ }
         else if (!strcmp(a,"--verify")) {
             const char *v = (i+1 < argc) ? argv[i+1] : NULL;
@@ -1430,6 +1520,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         else if (a[0]=='-') { fprintf(stderr,"unknown option: %s\n",a); return 2; }
         else source = a;
     }
+    if (J->clone) { if (source) strncpy(J->source, source, sizeof J->source - 1); return 0; }
     if (!source) { fprintf(stderr,
         "usage: p4br_create <source_folder> [-o out] [-k hexkey] [-H hashkey]\n"
         "                   [-n name] [-l label] [--verify true|false]\n"
@@ -1437,6 +1528,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         "                   [--set-user NAME] [--set-hostname NAME]\n"
         "                   [--openpsid 32HEX] [--set KEYIDHEX=STRING] ...\n"
         "                   [--keyset old|new]\n"
+        "       p4br_create --clone -t template.dat -o out   (reproduce template byte-for-byte)\n"
         "       p4br_create            (no args -> graphical mode)\n"
         "\n"
         "Packs <source_folder> into a SCECAF/P4BR container (archive.dat ...).\n"
