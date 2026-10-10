@@ -64,6 +64,11 @@ p4br_create            (no args → GUI)
 > OpenPSID must match the **target** console. Make the template on that console,
 > or override with `--openpsid`. Value sizes are fixed by the registry schema
 > (a string can't exceed its key's slot size).
+>
+> The output is sealed with the **same keyset as the template** (auto-detected).
+> A console can only validate its own keyset — e.g. a 5.05 unit uses the OLD
+> keyset, and a mismatched keyset restores as **DATA_CORRUPTED (CE-33310-0 /
+> 0x81300203)**. Force it with `--keyset old|new` if needed.
 
 Example:
 

@@ -642,7 +642,8 @@ static int rg_set_int(rg_reg *R, uint32_t keyid, uint32_t v)
 /* CAF template reader : pull + decrypt one segment from an archive.dat  */
 /* ===================================================================== */
 
-static const char *OLD_KEY_HEX = "79C8CCC889A1540D4F2E27BB614FD653";
+static const char *OLD_KEY_HEX      = "79C8CCC889A1540D4F2E27BB614FD653";
+static const char *OLD_HASH_KEY_HEX = "1F18C970D000AC7E6FCC1A8CDD89B4FECDA133A10EC8F525982223F5861F0200";
 
 /* read `size` bytes at global `off` from a (possibly split) archive set */
 static int caf_pread(const wchar_t *dir, uint64_t off, uint64_t size, uint8_t *buf)
@@ -673,14 +674,18 @@ static int caf_pread(const wchar_t *dir, uint64_t off, uint64_t size, uint8_t *b
 }
 
 /* locate segment with table index `want_index`, decrypt it; *out malloc'd.
- * Tries the new key then the old key (validated against seg index 1 = P4BR). */
-static int caf_read_seg(const wchar_t *dir, uint32_t want_index, uint8_t **out, uint64_t *outlen)
+ * Tries the new key then the old key (validated against seg index 1 = P4BR).
+ * keyset_out (nullable): 1 = new keyset, 0 = old keyset.
+ * hki_out    (nullable): the container's hasher/cipher key-index field (@0x10). */
+static int caf_read_seg(const wchar_t *dir, uint32_t want_index, uint8_t **out, uint64_t *outlen,
+                        int *keyset_out, uint64_t *hki_out)
 {
     uint8_t hdr[0x30];
     if (caf_pread(dir, 0, 0x30, hdr) != 0) return -1;
     if (memcmp(hdr, CAF_MAGIC, 6) != 0) return -2;
     uint64_t nseg; memcpy(&nseg, hdr + 0x18, 8);
     if (nseg == 0 || nseg > 2000000) return -3;
+    if (hki_out) memcpy(hki_out, hdr + 0x10, 8);
     uint8_t *tbl = malloc((size_t)(0x40*nseg));
     if (caf_pread(dir, 0x30, 0x40*nseg, tbl) != 0) { free(tbl); return -1; }
 
@@ -701,7 +706,11 @@ static int caf_read_seg(const wchar_t *dir, uint32_t want_index, uint8_t **out, 
             cbc_dec_cts(&kc, seed, ct, (nopad<8?nopad:8), pt);  /* just the first block(s) */
             /* need full P4BR magic: decrypt 16 bytes */
             uint8_t head[16]; cbc_dec_cts(&kc, seed, ct, (nopad<16?nopad:16), head);
-            if (memcmp(head, P4BR_MAGIC, 4) == 0) { chosen = (t ? okey : nkey); break; }
+            if (memcmp(head, P4BR_MAGIC, 4) == 0) {
+                chosen = (t ? okey : nkey);
+                if (keyset_out) *keyset_out = t ? 0 : 1;
+                break;
+            }
         }
         free(ct);
         break;
@@ -1018,6 +1027,7 @@ typedef struct {
     char  openpsid[40];      /* overlay: 32 hex chars -> P4BR+0x18 and reg hdr+0x10 */
     char  sets[MAX_SETS][160]; /* generic KEYIDHEX=string overlays */
     int   nsets;
+    char  keyset[8];         /* "old" | "new" (force); default follows template */
 } create_job_t;
 
 /* friendly registry key IDs (PS4 regmgr) */
@@ -1064,6 +1074,9 @@ static int run_create(const create_job_t *J)
     detect_aesni();
     aes_ctx ctx; aes_setup(&ctx, key);
     hmac256_t hbase; hmac256_init(&hbase, hkey, 32);
+    int user_key = (J->keyhex[0] != 0), user_hash = (J->hashhex[0] != 0);
+    uint64_t hki_used = 0x200000001ULL;   /* key-index field (high=table base, low=keyset idx) */
+    int tkeyset = -1; uint64_t thki = 0;  /* template's detected keyset / key-index (if any) */
 
     wchar_t *wsrc = utf8_to_wide(J->source);
     wchar_t *wout = utf8_to_wide(J->outdir[0] ? J->outdir : "backup_out");
@@ -1086,10 +1099,10 @@ static int run_create(const create_job_t *J)
     if (J->tmpl[0]) {
         wchar_t tdir[MAX_PATH*2]; dir_of_archive(J->tmpl, tdir, MAX_PATH*2);
         uint8_t *s3=NULL,*s4=NULL,*s5=NULL,*s0=NULL; uint64_t l3=0,l4=0,l5=0,l0=0;
-        int r3 = caf_read_seg(tdir, 4, &s3, &l3);   /* seg3 = registry   */
-        int r4 = caf_read_seg(tdir, 5, &s4, &l4);   /* seg4 = reboot     */
-        int r5 = caf_read_seg(tdir, 6, &s5, &l5);   /* seg5 = sparse     */
-        int r0 = caf_read_seg(tdir, 1, &s0, &l0);   /* seg0 = P4BR hdr   */
+        int r3 = caf_read_seg(tdir, 4, &s3, &l3, &tkeyset, &thki);  /* seg3 = registry */
+        int r4 = caf_read_seg(tdir, 5, &s4, &l4, NULL, NULL);      /* seg4 = reboot  */
+        int r5 = caf_read_seg(tdir, 6, &s5, &l5, NULL, NULL);      /* seg5 = sparse  */
+        int r0 = caf_read_seg(tdir, 1, &s0, &l0, NULL, NULL);      /* seg0 = P4BR hdr */
         if (r3==0 && l3==RG_BLOB && r4==0 && r5==0 && r0==0) {
             rg_reg R;
             if (rg_decode(s3, (uint32_t)l3, &R) == 0) {
@@ -1113,9 +1126,10 @@ static int run_create(const create_job_t *J)
                 rg_free(&R);
                 seg4buf=s4; seg4len=l4; seg5buf=s5; seg5len=l5; p4tmpl=s0; p4tmpllen=l0;
                 have_aux = 1;
-                printf("[+] aux from template %s : seg3=0x%llx seg4=0x%llx seg5=0x%llx\n",
+                printf("[+] aux from template %s : seg3=0x%llx seg4=0x%llx seg5=0x%llx (template keyset=%s)\n",
                        J->tmpl, (unsigned long long)RG_BLOB,
-                       (unsigned long long)seg4len, (unsigned long long)seg5len);
+                       (unsigned long long)seg4len, (unsigned long long)seg5len,
+                       tkeyset ? "new" : "old");
             } else free(s3);
         }
         if (!have_aux) {
@@ -1125,6 +1139,27 @@ static int run_create(const create_job_t *J)
                     r3, (unsigned long long)l3, r4, r5, r0);
         }
         if (have_aux) free(s3);   /* s4/s5/s0 kept; s3 already consumed */
+    }
+
+    /* ---- resolve keyset: --keyset wins, else match the template, else new ----
+     * The target console must use the same keyset the backup is sealed with; a
+     * 5.05 unit uses the OLD keyset, and a new-key backup restores as
+     * DATA_CORRUPTED (0x81300203). */
+    {
+        int want = -1;                                   /* -1 = default (new) */
+        if (J->keyset[0]) want = (J->keyset[0]=='o'||J->keyset[0]=='O') ? 0 : 1;
+        else if (tkeyset >= 0) want = tkeyset;           /* follow the template */
+        if (want < 0) want = 1;
+        hki_used = (have_aux && !J->keyset[0] && thki) ? thki
+                                                       : (want ? 0x200000001ULL : 0x200000000ULL);
+        if (!user_key && !user_hash) {
+            if (want == 0) { hex2bin(OLD_KEY_HEX, key, 16); hex2bin(OLD_HASH_KEY_HEX, hkey, 32); }
+            else           { hex2bin(DEFAULT_KEY, key, 16); hex2bin(DEFAULT_HASH_KEY, hkey, 32); }
+            aes_setup(&ctx, key); hmac256_init(&hbase, hkey, 32);
+        }
+        printf("[+] keyset=%s  key-index=0x%llx%s\n", want ? "new" : "old",
+               (unsigned long long)hki_used,
+               (user_key||user_hash) ? "  (cipher/hash overridden by -k/-H)" : "");
     }
 
     /* segment plan: seg0 P4BR, seg1 dirs, seg2 files, [seg3 reg, seg4, seg5,] payload */
@@ -1237,7 +1272,7 @@ static int run_create(const create_job_t *J)
     {
         uint8_t *hdrbuf = calloc(1, (size_t)header_size);
         memcpy(hdrbuf, CAF_MAGIC, 8);
-        uint64_t version = 2, hki = 0x200000001ULL;
+        uint64_t version = 2, hki = hki_used;
         memcpy(hdrbuf + 0x08, &version, 8);
         memcpy(hdrbuf + 0x10, &hki, 8);
         memcpy(hdrbuf + 0x18, &nseg, 8);
@@ -1247,7 +1282,7 @@ static int run_create(const create_job_t *J)
         uint8_t *tbl = hdrbuf + 0x30;
         for (uint64_t i = 0; i < nseg; i++) {
             uint8_t *r = tbl + 0x40*i;
-            uint64_t algo = 2, kidx = 0x200000001ULL;
+            uint64_t algo = 2, kidx = hki_used;
             memcpy(r + 0x00, &segs[i].index, 8);
             memcpy(r + 0x08, &segs[i].off, 8);
             memcpy(r + 0x10, &segs[i].pad, 8);
@@ -1347,6 +1382,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         else if (!strcmp(a,"--set-hostname"))           { if(++i<argc) strncpy(J->set_host,argv[i],sizeof J->set_host-1); }
         else if (!strcmp(a,"--openpsid"))               { if(++i<argc) strncpy(J->openpsid,argv[i],sizeof J->openpsid-1); }
         else if (!strcmp(a,"--set"))                    { if(++i<argc && J->nsets<MAX_SETS) strncpy(J->sets[J->nsets++],argv[i],159); }
+        else if (!strcmp(a,"--keyset"))                 { if(++i<argc) strncpy(J->keyset,argv[i],sizeof J->keyset-1); }
         else if (!strcmp(a,"--gui"))                    { /* handled in main */ }
         else if (!strcmp(a,"--verify")) {
             const char *v = (i+1 < argc) ? argv[i+1] : NULL;
@@ -1363,6 +1399,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         "                   [-t template_archive.dat]\n"
         "                   [--set-user NAME] [--set-hostname NAME]\n"
         "                   [--openpsid 32HEX] [--set KEYIDHEX=STRING] ...\n"
+        "                   [--keyset old|new]\n"
         "       p4br_create            (no args -> graphical mode)\n"
         "\n"
         "Packs <source_folder> into a SCECAF/P4BR container (archive.dat ...).\n"
@@ -1374,6 +1411,8 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         "--openpsid / --set edit registry values in seg3 before resealing.\n"
         "A restore validates OpenPSID, so the registry/OpenPSID must match the\n"
         "target console (use a template made on that console, or --openpsid).\n"
+        "The output keyset follows the template (a 5.05 unit uses the OLD keyset;\n"
+        "a mismatched keyset restores as DATA_CORRUPTED); force with --keyset.\n"
         "\n"
         "Without -t, no aux is written (round-trips through p4br_extract but is not\n"
         "a PS4-restorable backup).\n"); return 2; }
