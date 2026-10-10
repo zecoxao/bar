@@ -9,24 +9,33 @@
  *
  * Build (mingw64 -> native .exe):
  *   x86_64-w64-mingw32-gcc -O3 -maes -msse4.1 -mwindows \
- *       p4br_create_gui.c -o p4br_create_gui.exe -lshell32 -lole32 -luuid
+ *       p4br_create_gui.c -o p4br_create_gui.exe \
+ *       -lshell32 -lole32 -luuid -lgdi32 -lcomdlg32
  *
- * SCOPE / CAVEAT
- *   The container produced here round-trips through p4br_extract (and passes
- *   its --verify): the catalog, encryption and signatures are correct.  It is
- *   NOT guaranteed to be restorable by a real PS4, because the "aux metadata"
- *   segments (seg3..5 in a Sony backup -- a large structured table) are not
- *   reverse-engineered.  This tool emits no aux segments: payload starts right
- *   after the catalogs (the extractor handles aux = 0).
+ * AUX / RESTORABILITY
+ *   With a template archive.dat (-t / GUI "Template"), the aux metadata is
+ *   generated too: seg3 is the PS4 system registry (fully reverse-engineered --
+ *   deterministic XOR obfuscation + custom checksums, no per-console secret),
+ *   seg4 (reboot) and seg5 (sparse) are copied from the template, and the P4BR
+ *   header (OpenPSID / hardware / version / GUID) is kept from it.  seg3 values
+ *   can be edited before resealing (--set-user / --set-hostname / --openpsid /
+ *   --set KEYIDHEX=STRING).  A restore validates OpenPSID, so the registry and
+ *   OpenPSID must match the target console (make the template on that console,
+ *   or override with --openpsid).  Without a template, no aux is written and the
+ *   result round-trips through p4br_extract but is not PS4-restorable.
  *
  * Layout written (mirrors the format documented in p4br_extract):
  *   SCECAF header (0x30) | segment table (0x40*nseg) | segment signatures
  *   (0x30*nseg) | header HMAC (0x20) | zero pad to file_offset |
  *   seg data (each padded to CHUNK) ...
- *     seg0  = P4BR header
- *     seg1  = directory records (0x458 each)
- *     seg2  = file records      (0x458 each)
- *     seg3+ = one segment per file, payload in catalog order
+ *     seg0   = P4BR header
+ *     seg1   = directory records (0x458 each)
+ *     seg2   = file records      (0x458 each)
+ *     seg3   = system registry   (0x64600)  \
+ *     seg4   = reboot data                   > only with -t template
+ *     seg5   = sparse count                 /
+ *     seg6+  = one segment per file, payload in catalog order
+ *   (without -t: seg3+ = payload, no aux)
  */
 
 #include <windows.h>
@@ -54,6 +63,11 @@ static const char *DEFAULT_KEY  = "101851B22B669178970C5459B3CB8D45";
 static const char *DEFAULT_HASH_KEY =
     "184FBFBB6DC61433C7A5BD8259C1C21FFEC0ECBEC4319805EE0693869152EB52";
 
+/* forward declarations (used by the seg3 codec / template reader below) */
+static wchar_t *utf8_to_wide(const char *s);
+static int      hex2bin(const char *hex, uint8_t *out, int n);
+static void     detect_aesni(void);
+
 /* ===================================================================== */
 /* AES-128 : AES-NI primary, software fallback                           */
 /* ===================================================================== */
@@ -62,6 +76,7 @@ static int g_aesni = 0;
 
 typedef struct {
     __m128i ni_enc[11];
+    __m128i ni_dec[11];
     uint8_t sw[176];
 } aes_ctx;
 
@@ -104,6 +119,29 @@ static inline __m128i ni_enc_block(const aes_ctx *c, __m128i m)
     m = _mm_aesenc_si128(m, e[8]);
     m = _mm_aesenc_si128(m, e[9]);
     return _mm_aesenclast_si128(m, e[10]);
+}
+
+static void ni_dec_setup(aes_ctx *c)
+{
+    c->ni_dec[0] = c->ni_enc[10];
+    for (int i = 1; i < 10; i++) c->ni_dec[i] = _mm_aesimc_si128(c->ni_enc[10 - i]);
+    c->ni_dec[10] = c->ni_enc[0];
+}
+
+static inline __m128i ni_dec_block(const aes_ctx *c, __m128i m)
+{
+    const __m128i *d = c->ni_dec;
+    m = _mm_xor_si128(m, d[0]);
+    m = _mm_aesdec_si128(m, d[1]);
+    m = _mm_aesdec_si128(m, d[2]);
+    m = _mm_aesdec_si128(m, d[3]);
+    m = _mm_aesdec_si128(m, d[4]);
+    m = _mm_aesdec_si128(m, d[5]);
+    m = _mm_aesdec_si128(m, d[6]);
+    m = _mm_aesdec_si128(m, d[7]);
+    m = _mm_aesdec_si128(m, d[8]);
+    m = _mm_aesdec_si128(m, d[9]);
+    return _mm_aesdeclast_si128(m, d[10]);
 }
 
 /* ---- software AES (fallback) ---- */
@@ -176,10 +214,69 @@ static void sw_enc_block(const aes_ctx *c, const uint8_t in[16], uint8_t out[16]
     memcpy(out, s, 16);
 }
 
+static const uint8_t INV_SBOX[256] = {
+0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d };
+
+static inline uint8_t gmul(uint8_t a, uint8_t b)
+{
+    uint8_t p = 0;
+    for (int i = 0; i < 8; i++) { if (b & 1) p ^= a; uint8_t hi = a & 0x80; a <<= 1; if (hi) a ^= 0x1b; b >>= 1; }
+    return p;
+}
+
+static void sw_dec_block(const aes_ctx *c, const uint8_t in[16], uint8_t out[16])
+{
+    const uint8_t *rk = c->sw;
+    uint8_t s[16];
+    for (int i = 0; i < 16; i++) s[i] = in[i] ^ rk[16*10 + i];     /* AddRoundKey(10) */
+    for (int round = 9; round >= 0; round--) {
+        /* InvShiftRows */
+        uint8_t r[16] = {
+            s[0], s[13], s[10], s[7],
+            s[4], s[1],  s[14], s[11],
+            s[8], s[5],  s[2],  s[15],
+            s[12],s[9],  s[6],  s[3] };
+        for (int i = 0; i < 16; i++) r[i] = INV_SBOX[r[i]];        /* InvSubBytes */
+        for (int i = 0; i < 16; i++) s[i] = r[i] ^ rk[16*round + i]; /* AddRoundKey */
+        if (round > 0) {                                           /* InvMixColumns */
+            for (int col = 0; col < 4; col++) {
+                uint8_t *p = s + 4*col;
+                uint8_t a0=p[0],a1=p[1],a2=p[2],a3=p[3];
+                p[0]=gmul(a0,14)^gmul(a1,11)^gmul(a2,13)^gmul(a3,9);
+                p[1]=gmul(a0,9)^gmul(a1,14)^gmul(a2,11)^gmul(a3,13);
+                p[2]=gmul(a0,13)^gmul(a1,9)^gmul(a2,14)^gmul(a3,11);
+                p[3]=gmul(a0,11)^gmul(a1,13)^gmul(a2,9)^gmul(a3,14);
+            }
+        }
+    }
+    memcpy(out, s, 16);
+}
+
 static void aes_setup(aes_ctx *c, const uint8_t key[16])
 {
-    if (g_aesni) ni_key_setup(c, key);
+    if (g_aesni) { ni_key_setup(c, key); ni_dec_setup(c); }
     else         sw_key_setup(c, key);
+}
+
+static inline void aes_dec_block(const aes_ctx *c, const uint8_t in[16], uint8_t out[16])
+{
+    if (g_aesni) _mm_storeu_si128((__m128i *)out, ni_dec_block(c, _mm_loadu_si128((const __m128i *)in)));
+    else         sw_dec_block(c, in, out);
 }
 
 static inline void aes_enc_block(const aes_ctx *c, const uint8_t in[16], uint8_t out[16])
@@ -201,6 +298,28 @@ static void cbc_enc_blocks(const aes_ctx *c, const uint8_t *pt, size_t nblocks,
         memcpy(prev, ct + i*16, 16);
     }
     memcpy(iv, prev, 16);
+}
+
+/* CBC-decrypt `len` bytes (+ ciphertext-stealing tail) of ct into pt, IV=seed.
+ * Mirrors the extractor / seg3_codec cbc_dec: the sub-block tail is XORed with
+ * AES_ENC(prev_ct_block) (or AES_ENC(seed) when len<16). */
+static void cbc_dec_cts(const aes_ctx *c, const uint8_t seed[16],
+                        const uint8_t *ct, uint64_t len, uint8_t *pt)
+{
+    uint64_t full = len - (len % 16);
+    uint8_t prev[16]; memcpy(prev, seed, 16);
+    for (uint64_t i = 0; i < full; i += 16) {
+        uint8_t dec[16];
+        aes_dec_block(c, ct + i, dec);
+        for (int j = 0; j < 16; j++) pt[i+j] = dec[j] ^ prev[j];
+        memcpy(prev, ct + i, 16);
+    }
+    uint64_t r = len - full;
+    if (r) {
+        uint8_t ks[16];
+        aes_enc_block(c, (full >= 16) ? (ct + full - 16) : seed, ks);
+        for (uint64_t i = 0; i < r; i++) pt[full+i] = ct[full+i] ^ ks[i];
+    }
 }
 
 /* ===================================================================== */
@@ -302,6 +421,321 @@ static void hmac256_final(hmac256_t *h, uint8_t out[32])
     sha256_final(&h->in, ih);
     sha256_update(&h->out, ih, 32);
     sha256_final(&h->out, out);
+}
+
+/* ===================================================================== */
+/* seg3 = PS4 system registry : codec (decode + encode)                  */
+/*   Reversed from 1352k.elf sub_826E6690 / 505k.elf sub_826F44A0.       */
+/*   Every transform is deterministic (XOR + custom checksum) with no    */
+/*   per-console secret; verified byte-exact against real backups.       */
+/* ===================================================================== */
+
+#define RG_BLOB 0x64600ULL
+
+/* obfuscation XOR table (sub_826F4B10 / qword_82A36B10, 31 bytes) */
+static const uint8_t RG_OBF[31] = {
+0x41,0x89,0x85,0x63,0x8c,0xc3,0x97,0x2f,0xd8,0x8d,0x9c,0xe6,0xd7,0xe1,0xd5,0x30,
+0x8a,0x84,0xa5,0x34,0xb8,0x44,0x75,0x4e,0xf3,0x41,0xc5,0x57,0xfa,0x2b,0xd0 };
+/* key-id XOR table (qword_82A1BFD0, 16 bytes) */
+static const uint8_t RG_KID[16] = {
+0x1f,0x26,0xfd,0x8d,0xbf,0x0a,0x8d,0x92,0x7f,0x6b,0xa0,0x12,0xb4,0x0e,0x8f,0xb1 };
+/* checksum seed (byte_83CD2C80, 8 bytes) */
+static const uint8_t RG_HASH[8] = { 0x72,0x02,0x85,0x61,0xe0,0x1c,0xbb,0x89 };
+/* header XOR key (sub_826F4AC0 / dword_82A36AFC, 8 bytes) */
+static const uint8_t RG_T3[8]   = { 0x23,0x58,0xb7,0xac,0x94,0x24,0x94,0xb9 };
+
+/* sub_826F4B10: XOR obfuscation, self-inverse, keyed by (len,key) */
+static void rg_obf(uint8_t *buf, uint32_t len, uint32_t key)
+{
+    uint64_t v3 = (17ULL*len + ((17u*((key) + ((key>>16)&0xffff))) & 0xffff));
+    uint32_t v5 = (uint32_t)(v3 % 7);
+    int m = (int)(((32 - 3*v5) & 0xFFFFFFFE) - 1);
+    for (uint32_t i = 0; i < len; i++) buf[i] ^= RG_OBF[v5 + (i % m)];
+}
+
+/* sub_826F4BC0: 8-byte accumulator hash, top `outlen` bytes big-endian */
+static void rg_chk(const uint8_t *data, uint32_t len, uint8_t *out, int outlen)
+{
+    uint64_t acc; memcpy(&acc, RG_HASH, 8);
+    uint32_t v8 = 0, v9 = 0;
+    for (;;) {
+        v9 = v8;
+        if (v8 < len) {
+            uint64_t v10 = acc; int sh = 0, k = 0, last = 1;
+            for (;;) {
+                uint8_t b = data[v9];
+                v10 = v10 + ((uint64_t)((b ^ RG_HASH[k]) & 0xff) << sh);
+                v10 = v10 * (b ? b : 3);
+                last = k + 1; v9 = v8 + k + 1;
+                if (v9 >= len) break;
+                sh += 8;
+                if (!(k < 7)) break;
+                k++;
+            }
+            v8 += last; acc = v10;
+        }
+        if (v9 >= len) break;
+    }
+    uint8_t ab[8]; memcpy(ab, &acc, 8);
+    for (int i = 0; i < outlen; i++) out[i] = ab[7 - i];
+}
+
+/* desc+0 key-id mask (== its own inverse); returns v57 = v138 % 13 */
+static uint32_t rg_kidmask(uint32_t v138, uint8_t out[4])
+{
+    uint32_t v63 = v138 % 13;
+    uint8_t b[4] = { (uint8_t)(v138>>24),(uint8_t)(v138>>16),(uint8_t)(v138>>8),(uint8_t)v138 };
+    uint8_t d[4]; for (int j = 0; j < 4; j++) d[j] = b[j] ^ RG_KID[v63 + j];
+    out[0]=d[3]; out[1]=d[2]; out[2]=d[1]; out[3]=d[0];   /* little-endian u32 */
+    return v63;
+}
+
+static uint32_t rg_roundblk(uint32_t size){ return size ? ((size + 7) & 0xFFFFFFFC) : 0; }
+static void rg_xor_hdr(uint8_t *h){ for (int i = 0; i < 80; i++) h[i] ^= RG_T3[i % 8]; }
+
+typedef struct {
+    uint32_t v138; uint16_t type; uint16_t size;
+    uint32_t inl;              /* inline value (type 0)            */
+    uint8_t *val; uint32_t vlen; /* data-area value (type != 0)    */
+} rg_entry;
+
+typedef struct {
+    uint8_t   hdr[80];         /* plaintext header (de-XORed)      */
+    uint32_t  total;           /* index-table slot count           */
+    rg_entry *e; int n, cap;
+} rg_reg;
+
+static void rg_push(rg_reg *R, rg_entry x)
+{
+    if (R->n == R->cap) { R->cap = R->cap ? R->cap*2 : 1024; R->e = realloc(R->e, (size_t)R->cap*sizeof(rg_entry)); }
+    R->e[R->n++] = x;
+}
+static void rg_free(rg_reg *R){ for (int i=0;i<R->n;i++) free(R->e[i].val); free(R->e); R->e=NULL; R->n=R->cap=0; }
+
+/* decode a plaintext 0x64600 registry blob into R */
+static int rg_decode(const uint8_t *seg3, uint32_t len, rg_reg *R)
+{
+    memset(R, 0, sizeof *R);
+    if (len < 0x50) return -1;
+    memcpy(R->hdr, seg3, 80); rg_xor_hdr(R->hdr);
+    uint16_t total; memcpy(&total, R->hdr + 4, 2); R->total = total;
+    uint32_t data_start = 0x50 + 16u*total;
+    for (uint32_t i = 0; i < total; i++) {
+        uint8_t d[16]; memcpy(d, seg3 + 0x50 + 16*i, 16); rg_obf(d, 16, i);
+        int filler = 1; for (int j=0;j<16;j++) if (d[j]!=0x17){ filler=0; break; }
+        if (filler) continue;
+        uint16_t v57; memcpy(&v57, d+8, 2);
+        if (v57 > 12) continue;
+        uint16_t type, size; memcpy(&type, d+4, 2); memcpy(&size, d+6, 2);
+        uint32_t off, enc; memcpy(&off, d+12, 4); memcpy(&enc, d+0, 4);
+        uint8_t b[4] = { (uint8_t)(enc>>24),(uint8_t)(enc>>16),(uint8_t)(enc>>8),(uint8_t)enc };
+        uint8_t dd[4]; for (int j=0;j<4;j++) dd[j]=b[j]^RG_KID[v57+j];
+        uint32_t v138 = ((uint32_t)dd[0]<<24)|((uint32_t)dd[1]<<16)|((uint32_t)dd[2]<<8)|dd[3];
+        rg_entry ent; memset(&ent, 0, sizeof ent);
+        ent.v138=v138; ent.type=type; ent.size=size;
+        if (type == 0) { ent.inl = off; }
+        else {
+            uint32_t blen = rg_roundblk(size);
+            if (data_start + off + blen > len) return -2;
+            uint8_t *blk = malloc(blen ? blen : 1);
+            memcpy(blk, seg3 + data_start + off, blen);
+            rg_obf(blk, blen, v138);
+            ent.vlen = size; ent.val = malloc(size ? size : 1);
+            memcpy(ent.val, blk + 4, size); free(blk);
+        }
+        rg_push(R, ent);
+    }
+    return 0;
+}
+
+/* encode R back into a plaintext 0x64600 blob (out must be `len` bytes) */
+static void rg_encode(const rg_reg *R, uint8_t *out, uint32_t len)
+{
+    memset(out, 0, len);
+    uint32_t total = R->total, emitted = (uint32_t)R->n;
+    uint32_t v45 = 0x50 + 16u*total;
+    uint32_t datalen = 0;
+    for (uint32_t i = 0; i < emitted; i++) {
+        const rg_entry *e = &R->e[i];
+        uint8_t desc[16]; memset(desc, 0, 16);
+        uint8_t km[4]; uint32_t v63 = rg_kidmask(e->v138, km);
+        memcpy(desc+0, km, 4);
+        memcpy(desc+4, &e->type, 2);
+        memcpy(desc+6, &e->size, 2);
+        uint16_t v57w = (uint16_t)v63; memcpy(desc+8, &v57w, 2);
+        if (e->type == 0) { memcpy(desc+12, &e->inl, 4); }
+        else {
+            memcpy(desc+12, &datalen, 4);
+            uint32_t blen = rg_roundblk(e->size);
+            uint8_t *blk = malloc(blen ? blen : 1);
+            memset(blk, 0x22, blen);
+            rg_chk(e->val, e->size, blk, 4);
+            if (e->size) memcpy(blk+4, e->val, e->size);
+            rg_obf(blk, blen, e->v138);
+            memcpy(out + v45 + datalen, blk, blen); free(blk);
+            datalen += blen;
+        }
+        uint8_t dc[2]; rg_chk(desc, 16, dc, 2); memcpy(desc+10, dc, 2);
+        rg_obf(desc, 16, i);
+        memcpy(out + 0x50 + 16*i, desc, 16);
+    }
+    for (uint32_t i = emitted; i < total; i++) {
+        uint8_t desc[16]; memset(desc, 0x17, 16);
+        rg_obf(desc, 16, i);
+        memcpy(out + 0x50 + 16*i, desc, 16);
+    }
+    /* trailing padding: 0xE5 then obf in 0xE9 (233) chunks keyed by offset */
+    uint32_t pstart = v45 + datalen;
+    for (uint32_t j = pstart; j < len; j++) out[j] = 0xE5;
+    uint32_t off = 0, rem = len - pstart;
+    while (rem > 0) {
+        uint32_t clen = rem > 0xE8 ? 233 : rem;
+        rg_obf(out + pstart + off, clen, off);
+        off += clen; rem -= clen;
+    }
+    /* header: copy opaque status bytes, recompute derived fields */
+    uint8_t h[80]; memset(h, 0, 80);
+    memcpy(h+0,  R->hdr+0,  4);           /* id/version          */
+    uint16_t tw=(uint16_t)total, ew=(uint16_t)emitted; memcpy(h+4,&tw,2); memcpy(h+6,&ew,2);
+    memcpy(h+8, &datalen, 4);
+    memcpy(h+16, R->hdr+16, 16);          /* OpenPSID            */
+    memcpy(h+32, R->hdr+32, 4);           /* reg 0x1060000 value */
+    memcpy(h+40, R->hdr+40, 7);           /* +0x28..+0x2E status */
+    h[56] = R->hdr[56];                    /* +0x38               */
+    { uint8_t t[2]; rg_chk(h+32, 4, t, 2); memcpy(h+36, t, 2); }                 /* +0x24 */
+    { uint8_t v151[4] = { h[0x2B],h[0x2A],h[0x29],h[0x28] }, t[2];
+      rg_chk(v151, 4, t, 2); memcpy(h+38, t, 2); }                               /* +0x26 */
+    { uint8_t t[4]; rg_chk(h, 80, t, 4); memcpy(h+12, t, 4); }                   /* +0x0C */
+    rg_xor_hdr(h);
+    memcpy(out, h, 80);
+}
+
+/* overlay helpers ---------------------------------------------------- */
+static int rg_set_str(rg_reg *R, uint32_t keyid, const char *s)
+{
+    for (int i = 0; i < R->n; i++) {
+        rg_entry *e = &R->e[i];
+        if (e->v138 == keyid && e->type != 0) {
+            uint32_t sz = e->size, sl = (uint32_t)strlen(s);
+            if (sl > sz - 1) sl = sz ? sz - 1 : 0;
+            memset(e->val, 0, sz);
+            memcpy(e->val, s, sl);
+            return 1;
+        }
+    }
+    return 0;
+}
+static int rg_set_int(rg_reg *R, uint32_t keyid, uint32_t v)
+{
+    for (int i = 0; i < R->n; i++) {
+        rg_entry *e = &R->e[i];
+        if (e->v138 == keyid) {
+            if (e->type == 0) e->inl = v;
+            else if (e->vlen >= 4) memcpy(e->val, &v, 4);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ===================================================================== */
+/* CAF template reader : pull + decrypt one segment from an archive.dat  */
+/* ===================================================================== */
+
+static const char *OLD_KEY_HEX = "79C8CCC889A1540D4F2E27BB614FD653";
+
+/* read `size` bytes at global `off` from a (possibly split) archive set */
+static int caf_pread(const wchar_t *dir, uint64_t off, uint64_t size, uint8_t *buf)
+{
+    uint8_t *p = buf;
+    while (size > 0) {
+        long long n = (long long)(off / MAX_SEG);
+        uint64_t within = off % MAX_SEG;
+        wchar_t path[MAX_PATH*2];
+        if (n == 0) _snwprintf(path, MAX_PATH*2, L"%s\\archive.dat", dir);
+        else        _snwprintf(path, MAX_PATH*2, L"%s\\archive%04lld.dat", dir, n);
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)within;
+        SetFilePointerEx(h, li, NULL, FILE_BEGIN);
+        uint64_t want = MAX_SEG - within; if (want > size) want = size;
+        uint64_t got_total = 0;
+        while (got_total < want) {
+            DWORD got = 0, req = (DWORD)((want-got_total) > 0x40000000UL ? 0x40000000UL : (want-got_total));
+            if (!ReadFile(h, p + got_total, req, &got, NULL) || got == 0) break;
+            got_total += got;
+        }
+        CloseHandle(h);
+        if (got_total != want) return -1;
+        p += want; off += want; size -= want;
+    }
+    return 0;
+}
+
+/* locate segment with table index `want_index`, decrypt it; *out malloc'd.
+ * Tries the new key then the old key (validated against seg index 1 = P4BR). */
+static int caf_read_seg(const wchar_t *dir, uint32_t want_index, uint8_t **out, uint64_t *outlen)
+{
+    uint8_t hdr[0x30];
+    if (caf_pread(dir, 0, 0x30, hdr) != 0) return -1;
+    if (memcmp(hdr, CAF_MAGIC, 6) != 0) return -2;
+    uint64_t nseg; memcpy(&nseg, hdr + 0x18, 8);
+    if (nseg == 0 || nseg > 2000000) return -3;
+    uint8_t *tbl = malloc((size_t)(0x40*nseg));
+    if (caf_pread(dir, 0x30, 0x40*nseg, tbl) != 0) { free(tbl); return -1; }
+
+    /* pick key by decrypting the P4BR segment (index 1) and checking magic */
+    uint8_t nkey[16], okey[16]; hex2bin(DEFAULT_KEY, nkey, 16); hex2bin(OLD_KEY_HEX, okey, 16);
+    detect_aesni();
+    aes_ctx kc; const uint8_t *chosen = NULL;
+    for (uint64_t i = 0; i < nseg; i++) {
+        uint8_t *r = tbl + 0x40*i; uint64_t idx; memcpy(&idx, r, 8);
+        if (idx != 1) continue;
+        uint64_t off, nopad; memcpy(&off, r+8, 8); memcpy(&nopad, r+0x38, 8);
+        uint8_t seed[16]; memcpy(seed, r+0x28, 16);
+        if (nopad < 4 || nopad > 0x4000) break;
+        uint8_t *ct = malloc((size_t)nopad), pt[8];
+        if (caf_pread(dir, off, nopad, ct) != 0) { free(ct); break; }
+        for (int t = 0; t < 2; t++) {
+            aes_setup(&kc, t ? okey : nkey);
+            cbc_dec_cts(&kc, seed, ct, (nopad<8?nopad:8), pt);  /* just the first block(s) */
+            /* need full P4BR magic: decrypt 16 bytes */
+            uint8_t head[16]; cbc_dec_cts(&kc, seed, ct, (nopad<16?nopad:16), head);
+            if (memcmp(head, P4BR_MAGIC, 4) == 0) { chosen = (t ? okey : nkey); break; }
+        }
+        free(ct);
+        break;
+    }
+    if (!chosen) { free(tbl); return -4; }
+    aes_setup(&kc, chosen);
+
+    int rc = -5;
+    for (uint64_t i = 0; i < nseg; i++) {
+        uint8_t *r = tbl + 0x40*i; uint64_t idx; memcpy(&idx, r, 8);
+        if (idx != want_index) continue;
+        uint64_t off, nopad; memcpy(&off, r+8, 8); memcpy(&nopad, r+0x38, 8);
+        uint8_t seed[16]; memcpy(seed, r+0x28, 16);
+        uint8_t *ct = malloc((size_t)(nopad?nopad:1));
+        if (caf_pread(dir, off, nopad, ct) != 0) { free(ct); break; }
+        uint8_t *pt = malloc((size_t)(nopad?nopad:1));
+        cbc_dec_cts(&kc, seed, ct, nopad, pt);
+        free(ct);
+        *out = pt; *outlen = nopad; rc = 0; break;
+    }
+    free(tbl);
+    return rc;
+}
+
+/* strip the trailing \archive.dat (or \archiveNNNN.dat) to get the dir */
+static void dir_of_archive(const char *archive_path, wchar_t *wdir, int cap)
+{
+    wchar_t *wa = utf8_to_wide(archive_path);
+    _snwprintf(wdir, cap, L"%s", wa ? wa : L".");
+    free(wa);
+    wchar_t *bs = wcsrchr(wdir, L'\\'); wchar_t *fs = wcsrchr(wdir, L'/');
+    wchar_t *sep = (bs > fs) ? bs : fs;
+    if (sep) *sep = 0;              /* truncate to directory */
+    else wcscpy(wdir, L".");
 }
 
 /* ===================================================================== */
@@ -568,6 +1002,7 @@ static int seal_segment(writer_t *w, const aes_ctx *c, const hmac256_t *hbase,
 /* create job                                                            */
 /* ===================================================================== */
 
+#define MAX_SETS 32
 typedef struct {
     char  source[1024];
     char  outdir[1024];
@@ -576,7 +1011,18 @@ typedef struct {
     char  name[128];
     char  label[128];
     int   verify_after;
+    /* ---- aux / registry (seg3-5) generation ---- */
+    char  tmpl[1024];        /* template archive.dat providing seg3/4/5 + P4BR id */
+    char  set_user[128];     /* overlay: local user name  (key 0x07800200) */
+    char  set_host[128];     /* overlay: console name     (key 0x02050000) */
+    char  openpsid[40];      /* overlay: 32 hex chars -> P4BR+0x18 and reg hdr+0x10 */
+    char  sets[MAX_SETS][160]; /* generic KEYIDHEX=string overlays */
+    int   nsets;
 } create_job_t;
+
+/* friendly registry key IDs (PS4 regmgr) */
+#define RK_USER_NAME 0x07800200u
+#define RK_HOSTNAME  0x02050000u
 
 static int hex2bin(const char *hex, uint8_t *out, int n)
 {
@@ -633,8 +1079,57 @@ static int run_create(const create_job_t *J)
     uint64_t total_payload = 0;
     for (int i = 0; i < files.n; i++) total_payload += files.v[i].size;
 
-    /* segment plan: seg0 P4BR, seg1 dirs, seg2 files, seg3+ one per file */
-    uint64_t nseg = 3 + (uint64_t)files.n;
+    /* ---- aux (seg3 registry + seg4 reboot + seg5 sparse) from a template ---- */
+    int      have_aux = 0;
+    uint8_t *reg_blob = NULL, *seg4buf = NULL, *seg5buf = NULL, *p4tmpl = NULL;
+    uint64_t seg4len = 0, seg5len = 0, p4tmpllen = 0;
+    if (J->tmpl[0]) {
+        wchar_t tdir[MAX_PATH*2]; dir_of_archive(J->tmpl, tdir, MAX_PATH*2);
+        uint8_t *s3=NULL,*s4=NULL,*s5=NULL,*s0=NULL; uint64_t l3=0,l4=0,l5=0,l0=0;
+        int r3 = caf_read_seg(tdir, 4, &s3, &l3);   /* seg3 = registry   */
+        int r4 = caf_read_seg(tdir, 5, &s4, &l4);   /* seg4 = reboot     */
+        int r5 = caf_read_seg(tdir, 6, &s5, &l5);   /* seg5 = sparse     */
+        int r0 = caf_read_seg(tdir, 1, &s0, &l0);   /* seg0 = P4BR hdr   */
+        if (r3==0 && l3==RG_BLOB && r4==0 && r5==0 && r0==0) {
+            rg_reg R;
+            if (rg_decode(s3, (uint32_t)l3, &R) == 0) {
+                if (J->set_user[0]) printf("  [reg] user  -> %s (%s)\n", J->set_user, rg_set_str(&R,RK_USER_NAME,J->set_user)?"ok":"key not present");
+                if (J->set_host[0]) printf("  [reg] host  -> %s (%s)\n", J->set_host, rg_set_str(&R,RK_HOSTNAME,J->set_host)?"ok":"key not present");
+                if (J->openpsid[0] && strlen(J->openpsid)==32) {
+                    uint8_t ops[16];
+                    if (hex2bin(J->openpsid, ops, 16)==0) {
+                        memcpy(R.hdr+16, ops, 16);                 /* reg header OpenPSID */
+                        if (s0 && l0>=0x28) memcpy(s0+0x18, ops, 16); /* P4BR  OpenPSID */
+                        printf("  [reg] OpenPSID overridden\n");
+                    }
+                }
+                for (int si = 0; si < J->nsets; si++) {
+                    char tmp[160]; strncpy(tmp, J->sets[si], 159); tmp[159]=0;
+                    char *eq = strchr(tmp, '='); if (!eq) continue; *eq = 0;
+                    uint32_t kid = (uint32_t)strtoul(tmp, NULL, 16);
+                    printf("  [reg] %08x -> \"%s\" (%s)\n", kid, eq+1, rg_set_str(&R, kid, eq+1)?"ok":"key not present");
+                }
+                reg_blob = malloc(RG_BLOB); rg_encode(&R, reg_blob, RG_BLOB);
+                rg_free(&R);
+                seg4buf=s4; seg4len=l4; seg5buf=s5; seg5len=l5; p4tmpl=s0; p4tmpllen=l0;
+                have_aux = 1;
+                printf("[+] aux from template %s : seg3=0x%llx seg4=0x%llx seg5=0x%llx\n",
+                       J->tmpl, (unsigned long long)RG_BLOB,
+                       (unsigned long long)seg4len, (unsigned long long)seg5len);
+            } else free(s3);
+        }
+        if (!have_aux) {
+            free(s3); free(s4); free(s5); free(s0);
+            fprintf(stderr, "[!] template unusable (r3=%d l3=0x%llx r4=%d r5=%d r0=%d); "
+                            "creating WITHOUT aux (not PS4-restorable)\n",
+                    r3, (unsigned long long)l3, r4, r5, r0);
+        }
+        if (have_aux) free(s3);   /* s4/s5/s0 kept; s3 already consumed */
+    }
+
+    /* segment plan: seg0 P4BR, seg1 dirs, seg2 files, [seg3 reg, seg4, seg5,] payload */
+    uint64_t naux = have_aux ? 6 : 3;
+    uint64_t nseg = naux + (uint64_t)files.n;
     seg_out_t *segs = calloc((size_t)nseg, sizeof(seg_out_t));
 
     uint64_t header_size = 0x30 + 0x40*nseg + 0x30*nseg;
@@ -642,10 +1137,11 @@ static int run_create(const create_job_t *J)
     if (file_offset < CHUNK) file_offset = CHUNK;
 
     /* nopad sizes */
-    segs[0].nopad = P4BR_LEN;
+    segs[0].nopad = have_aux ? p4tmpllen : P4BR_LEN;
     segs[1].nopad = (uint64_t)dirs.n  * REC;
     segs[2].nopad = (uint64_t)files.n * REC;
-    for (int i = 0; i < files.n; i++) segs[3+i].nopad = files.v[i].size;
+    if (have_aux) { segs[3].nopad = RG_BLOB; segs[4].nopad = seg4len; segs[5].nopad = seg5len; }
+    for (int i = 0; i < files.n; i++) segs[naux+i].nopad = files.v[i].size;
 
     /* offsets + pads + segment index values */
     uint64_t off = file_offset;
@@ -653,24 +1149,27 @@ static int run_create(const create_job_t *J)
         segs[i].pad = pad_of(segs[i].nopad);
         segs[i].off = off;
         off += segs[i].pad;
-        segs[i].index = (i < 3) ? (i + 1) : (0x10000 + (i - 3));  /* mirror observed scheme */
+        segs[i].index = (i < naux) ? (i + 1) : (0x10000 + (i - naux));  /* observed scheme */
         rand_seed(segs[i].seed);
     }
     uint64_t file_size = 0; for (uint64_t i=0;i<nseg;i++) file_size += segs[i].nopad;
 
     writer_t w; writer_init(&w, wout);
 
-    /* ---- seg0: P4BR header ---- */
+    /* ---- seg0: P4BR header (templated from source console when aux present) ---- */
     {
-        uint8_t *p4 = calloc(1, P4BR_LEN);
-        memcpy(p4, P4BR_MAGIC, 4);
-        uint32_t ver = 2;         memcpy(p4 + 0x04, &ver, 4);
+        uint64_t p4len = segs[0].nopad;
+        uint8_t *p4 = calloc(1, (size_t)p4len);
+        if (have_aux && p4tmpl) memcpy(p4, p4tmpl, (size_t)p4len);   /* keep OpenPSID/hw/ver/GUID */
+        else { memcpy(p4, P4BR_MAGIC, 4); uint32_t ver = 2; memcpy(p4 + 0x04, &ver, 4); }
         uint32_t nd = (uint32_t)dirs.n, nf = (uint32_t)files.n;
         memcpy(p4 + 0x10, &nd, 4);
         memcpy(p4 + 0x14, &nf, 4);
-        strncpy((char*)p4 + 0x34, J->name[0]  ? J->name  : "PS4", 0x4B);
-        strncpy((char*)p4 + 0x80, J->label[0] ? J->label : (J->name[0]?J->name:"PS4 backup"), 0x7F);
-        src_t s = { p4, NULL, P4BR_LEN };
+        if (J->name[0])  { memset(p4 + 0x34, 0, 0x4B); strncpy((char*)p4 + 0x34, J->name, 0x4A); }
+        else if (!have_aux) strncpy((char*)p4 + 0x34, "PS4", 0x4A);
+        if (J->label[0]) { memset(p4 + 0x80, 0, 0x7F); strncpy((char*)p4 + 0x80, J->label, 0x7E); }
+        else if (!have_aux) strncpy((char*)p4 + 0x80, J->name[0]?J->name:"PS4 backup", 0x7E);
+        src_t s = { p4, NULL, p4len };
         uint8_t *ib = _aligned_malloc(BUFCAP,16), *ob = _aligned_malloc(BUFCAP,16);
         seal_segment(&w, &ctx, &hbase, &s, &segs[0], ib, ob);
         _aligned_free(ib); _aligned_free(ob); free(p4);
@@ -693,13 +1192,22 @@ static int run_create(const create_job_t *J)
         _aligned_free(ib); _aligned_free(ob);
     }
 
-    /* ---- seg3+ : payload, one segment per file ---- */
+    /* ---- seg3 registry, seg4 reboot, seg5 sparse (aux, from template) ---- */
+    if (have_aux) {
+        uint8_t *ib = _aligned_malloc(BUFCAP,16), *ob = _aligned_malloc(BUFCAP,16);
+        src_t s3 = { reg_blob, NULL, segs[3].nopad }; seal_segment(&w, &ctx, &hbase, &s3, &segs[3], ib, ob);
+        src_t s4 = { seg4buf,  NULL, segs[4].nopad }; seal_segment(&w, &ctx, &hbase, &s4, &segs[4], ib, ob);
+        src_t s5 = { seg5buf,  NULL, segs[5].nopad }; seal_segment(&w, &ctx, &hbase, &s5, &segs[5], ib, ob);
+        _aligned_free(ib); _aligned_free(ob);
+    }
+
+    /* ---- payload : one segment per file ---- */
     {
         uint8_t *ib = _aligned_malloc(BUFCAP,16), *ob = _aligned_malloc(BUFCAP,16);
         uint64_t doneb = 0; char hb[32], hb2[32]; human(total_payload, hb2);
         DWORD t0 = GetTickCount(), tlast = t0;
         for (int i = 0; i < files.n; i++) {
-            seg_out_t *sg = &segs[3 + i];
+            seg_out_t *sg = &segs[naux + i];
             HANDLE fh = INVALID_HANDLE_VALUE;
             if (sg->nopad) {
                 fh = CreateFileW(files.v[i].wfull, GENERIC_READ, FILE_SHARE_READ, NULL,
@@ -815,6 +1323,7 @@ static int run_create(const create_job_t *J)
     for (int i=0;i<dirs.n;i++)  { free(dirs.v[i].path);  free(dirs.v[i].wfull); }
     for (int i=0;i<files.n;i++) { free(files.v[i].path); free(files.v[i].wfull); }
     free(dirs.v); free(files.v); free(segs); free(wsrc); free(wout);
+    free(reg_blob); free(seg4buf); free(seg5buf); free(p4tmpl);
     return 0;
 }
 
@@ -833,6 +1342,11 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         else if (!strcmp(a,"-H")||!strcmp(a,"--hash-key")) { if(++i<argc) strncpy(J->hashhex,argv[i],sizeof J->hashhex-1); }
         else if (!strcmp(a,"-n")||!strcmp(a,"--name"))  { if(++i<argc) strncpy(J->name,argv[i],sizeof J->name-1); }
         else if (!strcmp(a,"-l")||!strcmp(a,"--label")) { if(++i<argc) strncpy(J->label,argv[i],sizeof J->label-1); }
+        else if (!strcmp(a,"-t")||!strcmp(a,"--template")) { if(++i<argc) strncpy(J->tmpl,argv[i],sizeof J->tmpl-1); }
+        else if (!strcmp(a,"--set-user"))               { if(++i<argc) strncpy(J->set_user,argv[i],sizeof J->set_user-1); }
+        else if (!strcmp(a,"--set-hostname"))           { if(++i<argc) strncpy(J->set_host,argv[i],sizeof J->set_host-1); }
+        else if (!strcmp(a,"--openpsid"))               { if(++i<argc) strncpy(J->openpsid,argv[i],sizeof J->openpsid-1); }
+        else if (!strcmp(a,"--set"))                    { if(++i<argc && J->nsets<MAX_SETS) strncpy(J->sets[J->nsets++],argv[i],159); }
         else if (!strcmp(a,"--gui"))                    { /* handled in main */ }
         else if (!strcmp(a,"--verify")) {
             const char *v = (i+1 < argc) ? argv[i+1] : NULL;
@@ -846,11 +1360,23 @@ static int parse_args(int argc, char **argv, create_job_t *J)
     if (!source) { fprintf(stderr,
         "usage: p4br_create <source_folder> [-o out] [-k hexkey] [-H hashkey]\n"
         "                   [-n name] [-l label] [--verify true|false]\n"
+        "                   [-t template_archive.dat]\n"
+        "                   [--set-user NAME] [--set-hostname NAME]\n"
+        "                   [--openpsid 32HEX] [--set KEYIDHEX=STRING] ...\n"
         "       p4br_create            (no args -> graphical mode)\n"
         "\n"
         "Packs <source_folder> into a SCECAF/P4BR container (archive.dat ...).\n"
-        "Round-trips through p4br_extract; not a PS4-restorable backup (the aux\n"
-        "metadata segments are not reverse-engineered).\n"); return 2; }
+        "\n"
+        "With -t <template archive.dat>, the aux metadata is produced too: seg3\n"
+        "(system registry), seg4 (reboot) and seg5 (sparse) are taken from the\n"
+        "template, and the P4BR header (OpenPSID / hardware / version) is kept from\n"
+        "it, yielding a restorable-SHAPED backup. --set-user / --set-hostname /\n"
+        "--openpsid / --set edit registry values in seg3 before resealing.\n"
+        "A restore validates OpenPSID, so the registry/OpenPSID must match the\n"
+        "target console (use a template made on that console, or --openpsid).\n"
+        "\n"
+        "Without -t, no aux is written (round-trips through p4br_extract but is not\n"
+        "a PS4-restorable backup).\n"); return 2; }
     strncpy(J->source, source, sizeof J->source - 1);
     return 0;
 }
@@ -868,9 +1394,15 @@ static int parse_args(int argc, char **argv, create_job_t *J)
 #define IDC_VERIFY     2007
 #define IDC_GO         2008
 #define IDC_STATUS     2009
+#define IDC_TMPL_EDIT  2010
+#define IDC_TMPL_BROWSE 2011
+#define IDC_USER       2012
+#define IDC_HOST       2013
+#define IDC_OPENPSID   2014
 #define WM_JOB_DONE    (WM_APP + 1)
 
 static HWND g_main, g_src, g_out, g_name, g_label, g_verify, g_go, g_status;
+static HWND g_tmpl, g_user, g_host, g_openpsid;
 static HFONT g_font;
 static volatile LONG g_running = 0;
 static create_job_t g_job;
@@ -902,6 +1434,20 @@ static int browse_folder(HWND owner, const char *title, char *out, int cap)
     return 1;
 }
 
+static int browse_file(HWND owner, const char *title, char *out, int cap)
+{
+    wchar_t wtitle[128], wfile[MAX_PATH*2] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle, 128);
+    OPENFILENAMEW ofn; memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn; ofn.hwndOwner = owner;
+    ofn.lpstrFilter = L"PS4 backup (archive.dat)\0archive*.dat\0All files\0*.*\0";
+    ofn.lpstrFile = wfile; ofn.nMaxFile = MAX_PATH*2; ofn.lpstrTitle = wtitle;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return 0;
+    WideCharToMultiByte(CP_UTF8, 0, wfile, -1, out, cap, NULL, NULL);
+    return 1;
+}
+
 static DWORD WINAPI gui_worker(LPVOID arg)
 {
     (void)arg;
@@ -917,10 +1463,14 @@ static void start_job(void)
 {
     if (InterlockedExchange(&g_running, 1)) return;
     memset(&g_job, 0, sizeof g_job);
-    GetWindowTextA(g_src,   g_job.source, sizeof g_job.source);
-    GetWindowTextA(g_out,   g_job.outdir, sizeof g_job.outdir);
-    GetWindowTextA(g_name,  g_job.name,   sizeof g_job.name);
-    GetWindowTextA(g_label, g_job.label,  sizeof g_job.label);
+    GetWindowTextA(g_src,     g_job.source,   sizeof g_job.source);
+    GetWindowTextA(g_out,     g_job.outdir,   sizeof g_job.outdir);
+    GetWindowTextA(g_name,    g_job.name,     sizeof g_job.name);
+    GetWindowTextA(g_label,   g_job.label,    sizeof g_job.label);
+    GetWindowTextA(g_tmpl,    g_job.tmpl,     sizeof g_job.tmpl);
+    GetWindowTextA(g_user,    g_job.set_user, sizeof g_job.set_user);
+    GetWindowTextA(g_host,    g_job.set_host, sizeof g_job.set_host);
+    GetWindowTextA(g_openpsid,g_job.openpsid, sizeof g_job.openpsid);
     g_job.verify_after = (SendMessageW(g_verify, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
 
     if (!g_job.source[0]) {
@@ -958,6 +1508,12 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             char p[1024];
             if (browse_folder(hw, "Select the output folder (for archive.dat)", p, sizeof p))
                 SetWindowTextA(g_out, p);
+            return 0;
+        }
+        case IDC_TMPL_BROWSE: {
+            char p[1024];
+            if (browse_file(hw, "Select a template archive.dat (for seg3/aux)", p, sizeof p))
+                SetWindowTextA(g_tmpl, p);
             return 0;
         }
         case IDC_GO: start_job(); return 0;
@@ -1000,7 +1556,7 @@ static int gui_run(void)
     wc.lpszClassName = L"p4br_create"; wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassW(&wc);
 
-    int W = 560, H = 290;
+    int W = 560, H = 440;
     g_main = CreateWindowW(L"p4br_create", L"PS4 backup creator (P4BR / SCECAF)",
                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                            CW_USEDEFAULT, CW_USEDEFAULT, W, H, NULL, NULL, GetModuleHandleW(NULL), NULL);
@@ -1018,15 +1574,29 @@ static int gui_run(void)
     mk(L"STATIC", L"Label:", 0, 225, 120, 45, 18, g_main, 0);
     g_label = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 275, 117, 265, 24, g_main, IDC_LABEL);
 
-    g_verify = mk(L"BUTTON", L"Verify after creating (recommended)", BS_AUTOCHECKBOX, 15, 152, 300, 20, g_main, IDC_VERIFY);
+    /* ---- aux / registry (restorable-shaped) ---- */
+    mk(L"STATIC", L"Template archive.dat (enables restorable aux: seg3 registry etc.):", 0, 15, 156, 525, 18, g_main, 0);
+    g_tmpl = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 15, 176, 430, 24, g_main, IDC_TMPL_EDIT);
+    mk(L"BUTTON", L"Browse...", 0, 455, 176, 85, 24, g_main, IDC_TMPL_BROWSE);
+
+    mk(L"STATIC", L"User:", 0, 15, 212, 45, 18, g_main, 0);
+    g_user = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 60, 209, 150, 24, g_main, IDC_USER);
+    mk(L"STATIC", L"Host:", 0, 225, 212, 45, 18, g_main, 0);
+    g_host = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 275, 209, 265, 24, g_main, IDC_HOST);
+
+    mk(L"STATIC", L"OpenPSID (32 hex, optional):", 0, 15, 244, 200, 18, g_main, 0);
+    g_openpsid = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 220, 241, 320, 24, g_main, IDC_OPENPSID);
+
+    g_verify = mk(L"BUTTON", L"Verify after creating (recommended)", BS_AUTOCHECKBOX, 15, 280, 300, 20, g_main, IDC_VERIFY);
     SendMessageW(g_verify, BM_SETCHECK, BST_CHECKED, 0);
 
-    g_go = mk(L"BUTTON", L"Create", BS_DEFPUSHBUTTON, 455, 150, 85, 28, g_main, IDC_GO);
+    g_go = mk(L"BUTTON", L"Create", BS_DEFPUSHBUTTON, 455, 278, 85, 28, g_main, IDC_GO);
 
     g_status = mk(L"STATIC",
-                  L"Packs a folder into a SCECAF/P4BR archive. Round-trips with the "
-                  L"extractor; not a PS4-restorable backup.",
-                  0, 15, 192, 525, 36, g_main, IDC_STATUS);
+                  L"Packs a folder into a SCECAF/P4BR archive. With a template, seg3/aux "
+                  L"are generated (restorable-shaped); the registry/OpenPSID must match the "
+                  L"target console. Without a template it round-trips with the extractor only.",
+                  0, 15, 320, 525, 54, g_main, IDC_STATUS);
 
     ShowWindow(g_main, SW_SHOW); UpdateWindow(g_main);
     MSG m;
