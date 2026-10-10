@@ -1158,10 +1158,25 @@ static int run_clone(const create_job_t *J)
         uint64_t off,pad,nop; memcpy(&off,r+8,8); memcpy(&pad,r+0x10,8); memcpy(&nop,r+0x38,8);
         uint8_t seed[16]; memcpy(seed,r+0x28,16);
         seg_out_t sg; memset(&sg,0,sizeof sg); sg.off=off; sg.pad=pad; sg.nopad=nop; memcpy(sg.seed,seed,16);
+        uint64_t idx; memcpy(&idx, r, 8);
         if (nop) {
             uint8_t *ct=malloc((size_t)nop), *pt=malloc((size_t)nop);
             if (caf_pread(tdir, off, nop, ct)!=0){ fprintf(stderr,"clone: read seg %llu\n",(unsigned long long)i); return 1; }
             cbc_dec_cts(&kc, seed, ct, nop, pt); free(ct);
+            /* seg3 = registry (idx 4, 0x64600): apply settings overlay before resealing.
+             * Everything else stays byte-identical to the (working) original. */
+            if (idx == 4 && nop == RG_BLOB &&
+                (J->set_user[0] || J->set_host[0] || J->openpsid[0] || J->nsets)) {
+                rg_reg R;
+                if (rg_decode(pt, (uint32_t)nop, &R) == 0) {
+                    if (J->set_user[0]) printf("  [reg] user -> %s (%s)\n", J->set_user, rg_set_str(&R,RK_USER_NAME,J->set_user)?"ok":"absent");
+                    if (J->set_host[0]) printf("  [reg] host -> %s (%s)\n", J->set_host, rg_set_str(&R,RK_HOSTNAME,J->set_host)?"ok":"absent");
+                    if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0){ memcpy(R.hdr+16,o,16); printf("  [reg] seg3 OpenPSID overridden (note: P4BR OpenPSID unchanged)\n"); } }
+                    for (int si=0; si<J->nsets; si++){ char t[160]; strncpy(t,J->sets[si],159); t[159]=0; char *eq=strchr(t,'='); if(!eq)continue; *eq=0; uint32_t kid=(uint32_t)strtoul(t,NULL,16); printf("  [reg] %08x -> \"%s\" (%s)\n",kid,eq+1, rg_set_str(&R,kid,eq+1)?"ok":"absent"); }
+                    rg_encode(&R, pt, (uint32_t)nop);   /* overwrite seg3 plaintext in place */
+                    rg_free(&R);
+                }
+            }
             src_t s={pt,NULL,nop}; seal_segment(&w,&kc,&hbase,&s,&sg,ib,ob); free(pt);
         } else {
             src_t es={NULL,NULL,0}; seal_segment(&w,&kc,&hbase,&es,&sg,ib,ob);  /* empty: placeholder */
