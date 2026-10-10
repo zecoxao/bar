@@ -1184,7 +1184,7 @@ static int run_create(const create_job_t *J)
         segs[i].pad = pad_of(segs[i].nopad);
         segs[i].off = off;
         off += segs[i].pad;
-        segs[i].index = (i < naux) ? (i + 1) : (0x10000 + (i - naux));  /* observed scheme */
+        segs[i].index = (i < naux) ? (i + 1) : (10000 + (i - naux));  /* payload base = 10000 (decimal) */
         rand_seed(segs[i].seed);
     }
     uint64_t file_size = 0; for (uint64_t i=0;i<nseg;i++) file_size += segs[i].nopad;
