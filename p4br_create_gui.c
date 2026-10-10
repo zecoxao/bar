@@ -949,6 +949,30 @@ static void fill_record(uint8_t rec[REC], const entry_t *e)
     memcpy(rec + 0x54, e->path, pl);     /* NUL already present */
 }
 
+/* find a catalog record (0x458) with matching path (@+0x54) in a template
+ * dir/file blob; returns pointer to the record or NULL. */
+static const uint8_t *tmpl_rec(const uint8_t *blob, uint64_t blob_len, const char *path)
+{
+    if (!blob || !path) return NULL;
+    uint64_t n = blob_len / REC;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t *r = blob + i*REC;
+        if (!strncmp((const char *)r + 0x54, path, REC - 0x54)) return r;
+    }
+    return NULL;
+}
+
+/* build a record: inherit all fields from the template record for this path
+ * (if any), overlaying only the live size for files; else fill from scratch. */
+static void fill_record_tmpl(uint8_t rec[REC], const entry_t *e,
+                             const uint8_t *tblob, uint64_t tlen)
+{
+    const uint8_t *tr = tmpl_rec(tblob, tlen, e->path);
+    if (!tr) { fill_record(rec, e); return; }
+    memcpy(rec, tr, REC);                      /* template's fields verbatim */
+    if (!e->is_dir) { uint64_t sz = e->size; memcpy(rec + 0x30, &sz, 8); } /* keep record/payload size consistent */
+}
+
 /* ===================================================================== */
 /* segment sealing : encrypt (CBC + CTS tail) + HMAC, write to archive    */
 /* ===================================================================== */
@@ -1234,6 +1258,8 @@ static int run_create(const create_job_t *J)
     int      have_aux = 0;
     uint8_t *reg_blob = NULL, *seg4buf = NULL, *seg5buf = NULL, *p4tmpl = NULL;
     uint64_t seg4len = 0, seg5len = 0, p4tmpllen = 0;
+    uint8_t *tcat_d = NULL, *tcat_f = NULL;    /* template dir/file catalog records */
+    uint64_t tcat_dl = 0, tcat_fl = 0;
     if (J->tmpl[0]) {
         wchar_t tdir[MAX_PATH*2]; dir_of_archive(J->tmpl, tdir, MAX_PATH*2);
         uint8_t *s3=NULL,*s4=NULL,*s5=NULL,*s0=NULL; uint64_t l3=0,l4=0,l5=0,l0=0;
@@ -1241,6 +1267,8 @@ static int run_create(const create_job_t *J)
         int r4 = caf_read_seg(tdir, 5, &s4, &l4, NULL, NULL);      /* seg4 = reboot  */
         int r5 = caf_read_seg(tdir, 6, &s5, &l5, NULL, NULL);      /* seg5 = sparse  */
         int r0 = caf_read_seg(tdir, 1, &s0, &l0, NULL, NULL);      /* seg0 = P4BR hdr */
+        if (caf_read_seg(tdir, 2, &tcat_d, &tcat_dl, NULL, NULL) != 0) { tcat_d=NULL; tcat_dl=0; } /* dir records  */
+        if (caf_read_seg(tdir, 3, &tcat_f, &tcat_fl, NULL, NULL) != 0) { tcat_f=NULL; tcat_fl=0; } /* file records */
         if (r3==0 && l3==RG_BLOB && r4==0 && r5==0 && r0==0) {
             rg_reg R;
             if (rg_decode(s3, (uint32_t)l3, &R) == 0) {
@@ -1354,14 +1382,24 @@ static int run_create(const create_job_t *J)
     /* ---- seg1 dirs, seg2 files : catalog blobs ---- */
     {
         uint8_t *ib = _aligned_malloc(BUFCAP,16), *ob = _aligned_malloc(BUFCAP,16);
+        int inh_d = 0, inh_f = 0;
         uint8_t *db = calloc(1, segs[1].nopad ? (size_t)segs[1].nopad : 1);
-        for (int i = 0; i < dirs.n; i++) fill_record(db + (size_t)i*REC, &dirs.v[i]);
+        for (int i = 0; i < dirs.n; i++) {
+            fill_record_tmpl(db + (size_t)i*REC, &dirs.v[i], tcat_d, tcat_dl);
+            if (tcat_d && tmpl_rec(tcat_d, tcat_dl, dirs.v[i].path)) inh_d++;
+        }
         src_t sd = { db, NULL, segs[1].nopad };
         seal_segment(&w, &ctx, &hbase, &sd, &segs[1], ib, ob);
         free(db);
 
         uint8_t *fb = calloc(1, segs[2].nopad ? (size_t)segs[2].nopad : 1);
-        for (int i = 0; i < files.n; i++) fill_record(fb + (size_t)i*REC, &files.v[i]);
+        for (int i = 0; i < files.n; i++) {
+            fill_record_tmpl(fb + (size_t)i*REC, &files.v[i], tcat_f, tcat_fl);
+            if (tcat_f && tmpl_rec(tcat_f, tcat_fl, files.v[i].path)) inh_f++;
+        }
+        if (tcat_d || tcat_f)
+            printf("[+] catalog fields inherited from template: %d/%d dirs, %d/%d files\n",
+                   inh_d, dirs.n, inh_f, files.n);
         src_t sf = { fb, NULL, segs[2].nopad };
         seal_segment(&w, &ctx, &hbase, &sf, &segs[2], ib, ob);
         free(fb);
@@ -1500,6 +1538,7 @@ static int run_create(const create_job_t *J)
     for (int i=0;i<files.n;i++) { free(files.v[i].path); free(files.v[i].wfull); }
     free(dirs.v); free(files.v); free(segs); free(wsrc); free(wout);
     free(reg_blob); free(seg4buf); free(seg5buf); free(p4tmpl);
+    free(tcat_d); free(tcat_f);
     return 0;
 }
 
