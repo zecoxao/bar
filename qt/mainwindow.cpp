@@ -4,7 +4,9 @@
 
 #include <QtWidgets>
 #include <QSettings>
+#include <QRegularExpression>
 #include <vector>
+#include <cstring>
 
 /* keep C-string arrays alive for the duration of a blocking bridge call */
 struct ArgHold {
