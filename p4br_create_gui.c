@@ -1129,6 +1129,33 @@ static void human(uint64_t n, char *out)
 /*   test: if even this restores as "corrupted", the template itself is   */
 /*   not restorable by the console (our generation is not the cause).     */
 /* ===================================================================== */
+/* CBC (+ ciphertext-stealing tail) encrypt, IV=seed (mirror of seal_segment). */
+static void cbc_enc_cts(const aes_ctx *c, const uint8_t seed[16],
+                        const uint8_t *pt, uint64_t len, uint8_t *ct)
+{
+    uint64_t full = len - (len % 16);
+    uint8_t iv[16]; memcpy(iv, seed, 16);
+    if (full) cbc_enc_blocks(c, pt, (size_t)(full/16), iv, ct);
+    uint64_t r = len - full;
+    if (r) {
+        uint8_t ks[16];
+        aes_enc_block(c, (full >= 16) ? (ct + full - 16) : seed, ks);
+        for (uint64_t i = 0; i < r; i++) ct[full+i] = pt[full+i] ^ ks[i];
+    }
+}
+
+/* copy `len` bytes verbatim from the template at global `off` to the output. */
+static void clone_copy(const wchar_t *tdir, writer_t *w, uint64_t off, uint64_t len, uint8_t *buf)
+{
+    uint64_t p = off, rem = len;
+    while (rem) {
+        uint64_t n = rem > BUFCAP ? BUFCAP : rem;
+        if (caf_pread(tdir, p, n, buf) != 0) break;
+        writer_write(w, p, buf, n);
+        p += n; rem -= n;
+    }
+}
+
 static int run_clone(const create_job_t *J)
 {
     detect_aesni();
@@ -1170,58 +1197,59 @@ static int run_clone(const create_job_t *J)
     printf("[+] clone %s : nseg=%llu keyset=%s%s\n", J->tmpl, (unsigned long long)nseg,
            ck==nkey?"new":"old", g_aesni?"  [AES-NI]":"");
 
-    uint8_t *ib=_aligned_malloc(BUFCAP,16), *ob=_aligned_malloc(BUFCAP,16);
-    uint8_t *hdrbuf = calloc(1,(size_t)hdr_size);
-    memcpy(hdrbuf, h0, 0x30);                 /* SCECAF header verbatim */
-    memcpy(hdrbuf+0x30, tbl, 0x40*nseg);      /* segment table verbatim */
+    /* whole header region (0..file_offset) verbatim; patch only changed sigs + HMAC */
+    uint8_t *hdrbuf = malloc((size_t)foff);
+    if (caf_pread(tdir, 0, foff, hdrbuf) != 0) { fprintf(stderr,"clone: header read\n"); return 1; }
     uint8_t *osig = hdrbuf + 0x30 + 0x40*nseg;
-    memcpy(osig, sigtbl, 0x30*nseg);          /* sig lead/trailer verbatim; sig recomputed below */
+    uint8_t *cbuf = _aligned_malloc(BUFCAP,16);
+    int nchanged = 0;
 
     for (uint64_t i = 0; i < nseg; i++) {
         uint8_t *r = tbl + 0x40*i;
         uint64_t off,pad,nop; memcpy(&off,r+8,8); memcpy(&pad,r+0x10,8); memcpy(&nop,r+0x38,8);
         uint8_t seed[16]; memcpy(seed,r+0x28,16);
-        seg_out_t sg; memset(&sg,0,sizeof sg); sg.off=off; sg.pad=pad; sg.nopad=nop; memcpy(sg.seed,seed,16);
         uint64_t idx; memcpy(&idx, r, 8);
-        if (nop) {
-            uint8_t *ct=malloc((size_t)nop), *pt=malloc((size_t)nop);
-            if (caf_pread(tdir, off, nop, ct)!=0){ fprintf(stderr,"clone: read seg %llu\n",(unsigned long long)i); return 1; }
-            cbc_dec_cts(&kc, seed, ct, nop, pt); free(ct);
-            /* seg3 = registry (idx 4, 0x64600): apply settings overlay before resealing.
-             * Everything else stays byte-identical to the (working) original. */
-            if (idx == 4 && nop == RG_BLOB &&
-                (J->set_user[0] || J->set_host[0] || J->openpsid[0] || J->nsets)) {
-                rg_reg R;
-                if (rg_decode(pt, (uint32_t)nop, &R) == 0) {
-                    if (J->set_user[0]) printf("  [reg] user -> %s (%s)\n", J->set_user, rg_set_str(&R,RK_USER_NAME,J->set_user)?"ok":"absent");
-                    if (J->set_host[0]) printf("  [reg] host -> %s (%s)\n", J->set_host, rg_set_str(&R,RK_HOSTNAME,J->set_host)?"ok":"absent");
-                    if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0){ memcpy(R.hdr+16,o,16); printf("  [reg] seg3 OpenPSID overridden (note: P4BR OpenPSID unchanged)\n"); } }
-                    for (int si=0; si<J->nsets; si++){ char t[160]; strncpy(t,J->sets[si],159); t[159]=0; char *eq=strchr(t,'='); if(!eq)continue; *eq=0; uint32_t kid=(uint32_t)strtoul(t,NULL,16); printf("  [reg] %08x -> \"%s\" (%s)\n",kid,eq+1, rg_set_str(&R,kid,eq+1)?"ok":"absent"); }
-                    rg_encode(&R, pt, (uint32_t)nop);   /* overwrite seg3 plaintext in place */
-                    rg_free(&R);
-                }
+        int candidate = nop &&
+            ((idx==4 && nop==RG_BLOB && (J->set_user[0]||J->set_host[0]||J->openpsid[0]||J->nsets)) ||
+             (idx==1 && nop>=0x100 && (J->name[0]||J->label[0]||J->openpsid[0])));
+        if (!candidate) { clone_copy(tdir, &w, off, pad, cbuf); continue; }
+
+        /* read the padded region, decrypt, apply edits, and re-seal ONLY if it changed */
+        uint8_t *buf = malloc((size_t)pad);
+        if (caf_pread(tdir, off, pad, buf)!=0){ fprintf(stderr,"clone: read seg %llu\n",(unsigned long long)i); return 1; }
+        uint8_t *pt = malloc((size_t)nop), *op = malloc((size_t)nop);
+        cbc_dec_cts(&kc, seed, buf, nop, pt); memcpy(op, pt, (size_t)nop);
+        if (idx == 4) {
+            rg_reg R;
+            if (rg_decode(pt, (uint32_t)nop, &R) == 0) {
+                if (J->set_user[0]) printf("  [reg] user -> %s (%s)\n", J->set_user, rg_set_str(&R,RK_USER_NAME,J->set_user)?"ok":"absent");
+                if (J->set_host[0]) printf("  [reg] host -> %s (%s)\n", J->set_host, rg_set_str(&R,RK_HOSTNAME,J->set_host)?"ok":"absent");
+                if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0){ memcpy(R.hdr+16,o,16); printf("  [reg] seg3 OpenPSID overridden\n"); } }
+                for (int si=0; si<J->nsets; si++){ char t[160]; strncpy(t,J->sets[si],159); t[159]=0; char *eq=strchr(t,'='); if(!eq)continue; *eq=0; uint32_t kid=(uint32_t)strtoul(t,NULL,16); printf("  [reg] %08x -> \"%s\" (%s)\n",kid,eq+1, rg_set_str(&R,kid,eq+1)?"ok":"absent"); }
+                rg_encode(&R, pt, (uint32_t)nop); rg_free(&R);
             }
-            /* seg0 = P4BR (idx 1): apply Name/Label/OpenPSID changes (only if they differ) */
-            if (idx == 1 && nop >= 0x100) {
-                if (J->name[0]  && strncmp((char*)pt+0x34, J->name,  0x4A)) { memset(pt+0x34,0,0x4A); strncpy((char*)pt+0x34, J->name,  0x49); printf("  [p4br] name -> %s\n", J->name); }
-                if (J->label[0] && strncmp((char*)pt+0x80, J->label, 0x7E)) { memset(pt+0x80,0,0x7E); strncpy((char*)pt+0x80, J->label, 0x7D); printf("  [p4br] label -> %s\n", J->label); }
-                if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(pt+0x18,o,16); }
-            }
-            src_t s={pt,NULL,nop}; seal_segment(&w,&kc,&hbase,&s,&sg,ib,ob); free(pt);
-        } else {
-            src_t es={NULL,NULL,0}; seal_segment(&w,&kc,&hbase,&es,&sg,ib,ob);  /* empty: placeholder */
+        } else { /* idx==1 P4BR */
+            if (J->name[0]  && strncmp((char*)pt+0x34, J->name,  0x4A)) { memset(pt+0x34,0,0x4A); strncpy((char*)pt+0x34, J->name,  0x49); printf("  [p4br] name -> %s\n", J->name); }
+            if (J->label[0] && strncmp((char*)pt+0x80, J->label, 0x7E)) { memset(pt+0x80,0,0x7E); strncpy((char*)pt+0x80, J->label, 0x7D); printf("  [p4br] label -> %s\n", J->label); }
+            if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(pt+0x18,o,16); }
         }
-        memcpy(osig + 0x30*i + 8, sg.sig, 32);   /* our recomputed HMAC into verbatim entry */
+        if (memcmp(pt, op, (size_t)nop) != 0) {       /* actually changed: re-encrypt nopad, keep padding */
+            cbc_enc_cts(&kc, seed, pt, nop, buf);     /* buf[0..nop] = new ct; buf[nop..pad] = orig pad */
+            hmac256_t hm=hbase; hmac256_update(&hm, buf, (size_t)nop); hmac256_final(&hm, osig + 0x30*i + 8);
+            nchanged++;
+        }
+        writer_write(&w, off, buf, pad);
+        free(buf); free(pt); free(op);
     }
-    writer_write(&w, 0, hdrbuf, hdr_size);
-    uint8_t hh[32]; hmac256_t hm=hbase; hmac256_update(&hm,hdrbuf,(size_t)hdr_size); hmac256_final(&hm,hh);
-    writer_write(&w, hdr_size, hh, 32);
-    uint64_t gap = foff - (hdr_size+32);
-    if ((int64_t)gap > 0) { uint8_t *z=calloc(1,(size_t)(gap>BUFCAP?BUFCAP:gap)); uint64_t p=hdr_size+32;
-        while(gap){ uint64_t wn=gap>BUFCAP?BUFCAP:gap; writer_write(&w,p,z,wn); p+=wn; gap-=wn; } free(z); }
-    _aligned_free(ib); _aligned_free(ob); free(hdrbuf); free(tbl); free(sigtbl);
+
+    /* recompute the header HMAC over the (possibly updated) header, write it back in place */
+    uint8_t hh[32]; hmac256_t hm=hbase; hmac256_update(&hm, hdrbuf, (size_t)hdr_size); hmac256_final(&hm, hh);
+    memcpy(hdrbuf + hdr_size, hh, 32);
+    writer_write(&w, 0, hdrbuf, foff);                /* header + gap verbatim, with patched sigs/HMAC */
+
+    _aligned_free(cbuf); free(hdrbuf); free(tbl); free(sigtbl);
     writer_close(&w); free(wout);
-    printf("[+] clone done -> %s  (diff it against the template; should be identical)\n",
+    printf("[+] clone done (%d segment%s changed) -> %s\n", nchanged, nchanged==1?"":"s",
            J->outdir[0]?J->outdir:"clone_out");
     return 0;
 }
