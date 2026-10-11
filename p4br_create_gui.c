@@ -1201,6 +1201,12 @@ static int run_clone(const create_job_t *J)
                     rg_free(&R);
                 }
             }
+            /* seg0 = P4BR (idx 1): apply Name/Label/OpenPSID changes (only if they differ) */
+            if (idx == 1 && nop >= 0x100) {
+                if (J->name[0]  && strncmp((char*)pt+0x34, J->name,  0x4A)) { memset(pt+0x34,0,0x4A); strncpy((char*)pt+0x34, J->name,  0x49); printf("  [p4br] name -> %s\n", J->name); }
+                if (J->label[0] && strncmp((char*)pt+0x80, J->label, 0x7E)) { memset(pt+0x80,0,0x7E); strncpy((char*)pt+0x80, J->label, 0x7D); printf("  [p4br] label -> %s\n", J->label); }
+                if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(pt+0x18,o,16); }
+            }
             src_t s={pt,NULL,nop}; seal_segment(&w,&kc,&hbase,&s,&sg,ib,ob); free(pt);
         } else {
             src_t es={NULL,NULL,0}; seal_segment(&w,&kc,&hbase,&es,&sg,ib,ob);  /* empty: placeholder */
@@ -1736,8 +1742,15 @@ static void start_job(void)
     GetWindowTextA(g_openpsid,g_job.openpsid, sizeof g_job.openpsid);
     g_job.verify_after = (SendMessageW(g_verify, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
 
-    if (!g_job.source[0]) {
-        MessageBoxW(g_main, L"Choose the source folder to back up first.", L"p4br_create", MB_ICONWARNING);
+    /* Template set + no source folder = MODIFY SETTINGS ONLY: clone the template
+     * byte-for-byte and change only the registry (restorable, since everything
+     * else stays identical to the working original). With a source folder it
+     * repacks those files instead (changes file contents). */
+    g_job.clone = (g_job.tmpl[0] && !g_job.source[0]) ? 1 : 0;
+
+    if (!g_job.source[0] && !g_job.tmpl[0]) {
+        MessageBoxW(g_main, L"Choose a source folder to back up, or a template archive.dat to modify.",
+                    L"p4br_create", MB_ICONWARNING);
         InterlockedExchange(&g_running, 0); return;
     }
     if (!g_job.outdir[0]) {
@@ -1832,7 +1845,7 @@ static int gui_run(void)
                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                            CW_USEDEFAULT, CW_USEDEFAULT, W, H, NULL, NULL, GetModuleHandleW(NULL), NULL);
 
-    mk(L"STATIC", L"Source folder to back up:", 0, 15, 12, 360, 18, g_main, 0);
+    mk(L"STATIC", L"Source folder to back up (leave EMPTY to just modify the template's settings):", 0, 15, 12, 520, 18, g_main, 0);
     g_src = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 15, 32, 430, 24, g_main, IDC_SRC_EDIT);
     mk(L"BUTTON", L"Browse...", 0, 455, 32, 85, 24, g_main, IDC_SRC_BROWSE);
 
@@ -1864,9 +1877,9 @@ static int gui_run(void)
     g_go = mk(L"BUTTON", L"Create", BS_DEFPUSHBUTTON, 455, 278, 85, 28, g_main, IDC_GO);
 
     g_status = mk(L"STATIC",
-                  L"Packs a folder into a SCECAF/P4BR archive. With a template, seg3/aux "
-                  L"are generated (restorable-shaped); the registry/OpenPSID must match the "
-                  L"target console. Without a template it round-trips with the extractor only.",
+                  L"MODIFY SETTINGS: pick a Template, leave Source EMPTY, edit the fields, Create "
+                  L"-> a clone of the template with only those settings changed (restorable). "
+                  L"Set a Source folder instead to repack files (changes contents).",
                   0, 15, 320, 525, 54, g_main, IDC_STATUS);
 
     ShowWindow(g_main, SW_SHOW); UpdateWindow(g_main);
