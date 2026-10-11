@@ -48,8 +48,30 @@ p4br_create <source_folder> [-o out] [-n name] [-l label] [--verify true|false]
 p4br_create            (no args → GUI)
 ```
 
-* **Without `-t`**: packs the folder into a valid SCECAF/P4BR container that
-  round-trips through `p4br_extract` (no aux — not PS4-restorable).
+### Files-only (recommended): capture a skeleton once
+
+A backup's `seg3` is the **whole PS4 registry**, `seg0` holds the registered
+**accounts** / **OpenPSID**, and `seg4` is reboot-state — all live console
+state that isn't in firmware. Capture it **once** from any real backup of your
+console, then create backups from **just the files**:
+
+```
+p4br_create --make-skeleton  "X:\PS4\EXPORT\BACKUP\…\archive.dat"
+            -> writes  <exe dir>\p4br_skeleton\archive.dat
+
+p4br_create  ./my_files  -o ./out  --set-user NAME --set-hostname NAME
+            -> uses the bundled skeleton automatically; no template needed
+```
+
+In the GUI: click **Make skeleton from a backup…** once, then just pick a
+**Source** folder and **Create** (identity fields auto-fill from the skeleton
+and stay editable). The output keeps the skeleton console's OpenPSID /
+hardware, so it restores to that console.
+
+### Explicit template / no aux
+
+* **Without `-t` and no skeleton**: packs the folder into a valid SCECAF/P4BR
+  container that round-trips through `p4br_extract` (no aux — not restorable).
 * **With `-t <template archive.dat>`**: also writes the aux segments. seg3
   (registry), seg4 and seg5 are taken from the template, and the P4BR header
   (OpenPSID / hardware / version / GUID) is kept from it, producing a

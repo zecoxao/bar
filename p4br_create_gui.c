@@ -1087,6 +1087,7 @@ typedef struct {
     int   nsets;
     char  keyset[8];         /* "old" | "new" (force); default follows template */
     int   clone;             /* reproduce -t template byte-for-byte (diagnostic) */
+    int   make_skeleton;     /* extract aux skeleton from source (a backup) */
 } create_job_t;
 
 /* friendly registry key IDs (PS4 regmgr) */
@@ -1141,6 +1142,65 @@ static void clear_output(const wchar_t *dir)
         if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) break;
         DeleteFileW(path);
     }
+}
+
+/* ---- console "skeleton": the aux (P4BR + registry + reboot + sparse) captured
+ * once from a real backup, so later creates need only the files. --------- */
+static void exe_dir(wchar_t *out, int cap)
+{
+    GetModuleFileNameW(NULL, out, cap);
+    wchar_t *bs = wcsrchr(out, L'\\');
+    if (bs) *bs = 0; else wcscpy(out, L".");
+}
+/* skeleton lives as archive.dat in its own folder (the caf reader needs that name) */
+static void skeleton_path(wchar_t *out, int cap)
+{
+    wchar_t dir[MAX_PATH*2]; exe_dir(dir, MAX_PATH*2);
+    _snwprintf(out, cap, L"%s\\p4br_skeleton\\archive.dat", dir);
+}
+
+/* build <exe>\p4br_skeleton.bar = header + seg0..seg5 of a real backup (no payload) */
+static int run_make_skeleton(const char *backup, const char *outskel_opt)
+{
+    detect_aesni();
+    wchar_t tdir[MAX_PATH*2]; dir_of_archive(backup, tdir, MAX_PATH*2);
+    uint8_t h0[0x30];
+    if (caf_pread(tdir, 0, 0x30, h0) != 0 || memcmp(h0, CAF_MAGIC, 6) != 0) { fprintf(stderr,"skeleton: not a SCECAF backup\n"); return 1; }
+    uint64_t nseg; memcpy(&nseg, h0 + 0x18, 8);
+    uint64_t foff; memcpy(&foff, h0 + 0x20, 8);
+    if (!nseg || nseg > 2000000) { fprintf(stderr,"skeleton: bad nseg\n"); return 1; }
+    uint8_t *tbl = malloc((size_t)(0x40*nseg));
+    if (caf_pread(tdir, 0x30, 0x40*nseg, tbl) != 0) { free(tbl); fprintf(stderr,"skeleton: read table\n"); return 1; }
+    uint64_t aux_end = foff;
+    for (uint64_t i = 0; i < nseg; i++) {
+        uint8_t *r = tbl + 0x40*i; uint64_t idx; memcpy(&idx, r, 8);
+        if (idx >= 1 && idx <= 6) {
+            uint64_t off,pad,nop; memcpy(&off,r+8,8); memcpy(&pad,r+0x10,8); memcpy(&nop,r+0x38,8);
+            if (nop && off >= foff && off + pad > aux_end) aux_end = off + pad;
+        }
+    }
+    free(tbl);
+
+    wchar_t skp[MAX_PATH*2];
+    if (outskel_opt && outskel_opt[0]) { wchar_t *w = utf8_to_wide(outskel_opt); wcsncpy(skp, w, MAX_PATH*2-1); skp[MAX_PATH*2-1]=0; free(w); }
+    else skeleton_path(skp, MAX_PATH*2);
+    { wchar_t pdir[MAX_PATH*2]; wcsncpy(pdir, skp, MAX_PATH*2-1); pdir[MAX_PATH*2-1]=0;
+      wchar_t *bs = wcsrchr(pdir, L'\\'); if (bs) { *bs = 0; CreateDirectoryW(pdir, NULL); } }
+    HANDLE oh = CreateFileW(skp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (oh == INVALID_HANDLE_VALUE) { fprintf(stderr,"skeleton: cannot write output\n"); return 1; }
+    uint8_t *buf = malloc(BUFCAP); uint64_t pos = 0; int ok = 1;
+    while (pos < aux_end) {
+        uint64_t n = aux_end - pos; if (n > BUFCAP) n = BUFCAP;
+        if (caf_pread(tdir, pos, n, buf) != 0) { ok = 0; break; }
+        DWORD wr = 0; if (!WriteFile(oh, buf, (DWORD)n, &wr, NULL) || wr != (DWORD)n) { ok = 0; break; }
+        pos += n;
+    }
+    free(buf); CloseHandle(oh);
+    if (!ok) { fprintf(stderr,"skeleton: copy failed\n"); return 1; }
+    char skpu[MAX_PATH*2]; WideCharToMultiByte(CP_UTF8,0,skp,-1,skpu,sizeof skpu,NULL,NULL);
+    printf("[+] skeleton saved: %s (%llu bytes)\n[+] now create backups from files only (no template).\n",
+           skpu, (unsigned long long)aux_end);
+    return 0;
 }
 
 /* CBC (+ ciphertext-stealing tail) encrypt, IV=seed (mirror of seal_segment). */
@@ -1276,6 +1336,7 @@ static int run_create(const create_job_t *J)
         if (!J->tmpl[0]) { fprintf(stderr,"--clone needs -t <template archive.dat>\n"); return 2; }
         return run_clone(J);
     }
+    if (J->make_skeleton) return run_make_skeleton(J->source, J->outdir);
     const char *keyhex  = J->keyhex[0]  ? J->keyhex  : DEFAULT_KEY;
     const char *hashhex = J->hashhex[0] ? J->hashhex : DEFAULT_HASH_KEY;
 
@@ -1289,6 +1350,16 @@ static int run_create(const create_job_t *J)
     int user_key = (J->keyhex[0] != 0), user_hash = (J->hashhex[0] != 0);
     uint64_t hki_used = 0x200000001ULL;   /* key-index field (high=table base, low=keyset idx) */
     int tkeyset = -1; uint64_t thki = 0;  /* template's detected keyset / key-index (if any) */
+
+    /* template = user's -t, else the bundled skeleton (files-only mode) */
+    char tmpl[1024]; strncpy(tmpl, J->tmpl, sizeof tmpl - 1); tmpl[sizeof tmpl - 1] = 0;
+    if (!tmpl[0]) {
+        wchar_t skp[MAX_PATH*2]; skeleton_path(skp, MAX_PATH*2);
+        if (GetFileAttributesW(skp) != INVALID_FILE_ATTRIBUTES) {
+            WideCharToMultiByte(CP_UTF8, 0, skp, -1, tmpl, sizeof tmpl, NULL, NULL);
+            printf("[+] using bundled skeleton for aux (registry/reboot/sparse/identity)\n");
+        }
+    }
 
     wchar_t *wsrc = utf8_to_wide(J->source);
     wchar_t *wout = utf8_to_wide(J->outdir[0] ? J->outdir : "backup_out");
@@ -1311,8 +1382,8 @@ static int run_create(const create_job_t *J)
     uint64_t seg4len = 0, seg5len = 0, p4tmpllen = 0;
     uint8_t *tcat_d = NULL, *tcat_f = NULL;    /* template dir/file catalog records */
     uint64_t tcat_dl = 0, tcat_fl = 0;
-    if (J->tmpl[0]) {
-        wchar_t tdir[MAX_PATH*2]; dir_of_archive(J->tmpl, tdir, MAX_PATH*2);
+    if (tmpl[0]) {
+        wchar_t tdir[MAX_PATH*2]; dir_of_archive(tmpl, tdir, MAX_PATH*2);
         uint8_t *s3=NULL,*s4=NULL,*s5=NULL,*s0=NULL; uint64_t l3=0,l4=0,l5=0,l0=0;
         int r3 = caf_read_seg(tdir, 4, &s3, &l3, &tkeyset, &thki);  /* seg3 = registry */
         int r4 = caf_read_seg(tdir, 5, &s4, &l4, NULL, NULL);      /* seg4 = reboot  */
@@ -1345,7 +1416,7 @@ static int run_create(const create_job_t *J)
                 have_aux = 1;
                 g_have_empty_sig = (caf_empty_sig(tdir, g_empty_sig) == 0);  /* placeholder for 0-byte files */
                 printf("[+] aux from template %s : seg3=0x%llx seg4=0x%llx seg5=0x%llx (template keyset=%s)\n",
-                       J->tmpl, (unsigned long long)RG_BLOB,
+                       tmpl, (unsigned long long)RG_BLOB,
                        (unsigned long long)seg4len, (unsigned long long)seg5len,
                        tkeyset ? "new" : "old");
             } else free(s3);
@@ -1618,6 +1689,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         else if (!strcmp(a,"--set"))                    { if(++i<argc && J->nsets<MAX_SETS) strncpy(J->sets[J->nsets++],argv[i],159); }
         else if (!strcmp(a,"--keyset"))                 { if(++i<argc) strncpy(J->keyset,argv[i],sizeof J->keyset-1); }
         else if (!strcmp(a,"--clone"))                  { J->clone = 1; }
+        else if (!strcmp(a,"--make-skeleton"))          { J->make_skeleton = 1; }
         else if (!strcmp(a,"--gui"))                    { /* handled in main */ }
         else if (!strcmp(a,"--verify")) {
             const char *v = (i+1 < argc) ? argv[i+1] : NULL;
@@ -1629,6 +1701,10 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         else source = a;
     }
     if (J->clone) { if (source) strncpy(J->source, source, sizeof J->source - 1); return 0; }
+    if (J->make_skeleton) {
+        if (!source) { fprintf(stderr,"--make-skeleton needs a backup archive.dat as the argument\n"); return 2; }
+        strncpy(J->source, source, sizeof J->source - 1); return 0;
+    }
     if (!source) { fprintf(stderr,
         "usage: p4br_create <source_folder> [-o out] [-k hexkey] [-H hashkey]\n"
         "                   [-n name] [-l label] [--verify true|false]\n"
@@ -1637,6 +1713,8 @@ static int parse_args(int argc, char **argv, create_job_t *J)
         "                   [--openpsid 32HEX] [--set KEYIDHEX=STRING] ...\n"
         "                   [--keyset old|new]\n"
         "       p4br_create --clone -t template.dat -o out   (reproduce template byte-for-byte)\n"
+        "       p4br_create --make-skeleton <backup\\archive.dat> [-o p4br_skeleton.bar]\n"
+        "            (capture console aux ONCE; then create needs only the files)\n"
         "       p4br_create            (no args -> graphical mode)\n"
         "\n"
         "Packs <source_folder> into a SCECAF/P4BR container (archive.dat ...).\n"
@@ -1675,6 +1753,7 @@ static int parse_args(int argc, char **argv, create_job_t *J)
 #define IDC_USER       2012
 #define IDC_HOST       2013
 #define IDC_OPENPSID   2014
+#define IDC_MKSKEL     2015
 #define WM_JOB_DONE    (WM_APP + 1)
 
 static HWND g_main, g_src, g_out, g_name, g_label, g_verify, g_go, g_status;
@@ -1850,6 +1929,24 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 if (p[0]) autofill_from_template(p);
             }
             return 0;
+        case IDC_MKSKEL: {
+            char p[1024];
+            if (browse_file(hw, "Select a backup archive.dat to capture the console skeleton from", p, sizeof p)) {
+                ensure_console();
+                int rc = run_make_skeleton(p, NULL);
+                if (rc == 0) {
+                    wchar_t skp[MAX_PATH*2]; skeleton_path(skp, MAX_PATH*2);
+                    char skpu[1024]; WideCharToMultiByte(CP_UTF8,0,skp,-1,skpu,sizeof skpu,NULL,NULL);
+                    autofill_from_template(skpu);      /* fill identity fields from it */
+                    MessageBoxW(hw, L"Skeleton captured. You can now create backups from files only (leave Template blank).",
+                                L"p4br_create", MB_ICONINFORMATION);
+                } else {
+                    MessageBoxW(hw, L"Could not capture the skeleton (is that a valid backup archive.dat?).",
+                                L"p4br_create", MB_ICONWARNING);
+                }
+            }
+            return 0;
+        }
         case IDC_GO: start_job(); return 0;
         }
         break;
@@ -1908,10 +2005,11 @@ static int gui_run(void)
     mk(L"STATIC", L"Label:", 0, 225, 120, 45, 18, g_main, 0);
     g_label = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 275, 117, 265, 24, g_main, IDC_LABEL);
 
-    /* ---- aux / registry (restorable-shaped) ---- */
-    mk(L"STATIC", L"Template archive.dat (enables restorable aux: seg3 registry etc.):", 0, 15, 156, 525, 18, g_main, 0);
-    g_tmpl = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 15, 176, 430, 24, g_main, IDC_TMPL_EDIT);
-    mk(L"BUTTON", L"Browse...", 0, 455, 176, 85, 24, g_main, IDC_TMPL_BROWSE);
+    /* ---- aux / registry: bundled skeleton (made once), or an explicit template ---- */
+    mk(L"STATIC", L"Console skeleton: made ONCE from a backup -> then create from files only. (Optional: override with a template below.)", 0, 15, 156, 525, 18, g_main, 0);
+    mk(L"BUTTON", L"Make skeleton from a backup...", 0, 15, 174, 230, 24, g_main, IDC_MKSKEL);
+    g_tmpl = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 255, 174, 190, 24, g_main, IDC_TMPL_EDIT);
+    mk(L"BUTTON", L"Template...", 0, 455, 174, 85, 24, g_main, IDC_TMPL_BROWSE);
 
     mk(L"STATIC", L"User:", 0, 15, 212, 45, 18, g_main, 0);
     g_user = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 60, 209, 150, 24, g_main, IDC_USER);
@@ -1927,10 +2025,18 @@ static int gui_run(void)
     g_go = mk(L"BUTTON", L"Create", BS_DEFPUSHBUTTON, 455, 278, 85, 28, g_main, IDC_GO);
 
     g_status = mk(L"STATIC",
-                  L"MODIFY SETTINGS: pick a Template, leave Source EMPTY, edit the fields, Create "
-                  L"-> a clone of the template with only those settings changed (restorable). "
-                  L"Set a Source folder instead to repack files (changes contents).",
+                  L"FILES ONLY: capture a skeleton once (button above), then Source=your files, "
+                  L"edit fields, Create. MODIFY SETTINGS ONLY: pick a Template, leave Source empty "
+                  L"(clones it, changing only the fields).",
                   0, 15, 320, 525, 54, g_main, IDC_STATUS);
+
+    /* if a skeleton was already captured, pre-fill the identity fields from it */
+    { wchar_t skp[MAX_PATH*2]; skeleton_path(skp, MAX_PATH*2);
+      if (GetFileAttributesW(skp) != INVALID_FILE_ATTRIBUTES) {
+          char skpu[1024]; WideCharToMultiByte(CP_UTF8,0,skp,-1,skpu,sizeof skpu,NULL,NULL);
+          autofill_from_template(skpu);
+          SetWindowTextW(g_status, L"Skeleton ready. Pick a Source folder (your files), edit fields, Create.");
+      } }
 
     ShowWindow(g_main, SW_SHOW); UpdateWindow(g_main);
     MSG m;
