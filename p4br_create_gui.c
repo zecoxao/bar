@@ -1129,6 +1129,20 @@ static void human(uint64_t n, char *out)
 /*   test: if even this restores as "corrupted", the template itself is   */
 /*   not restorable by the console (our generation is not the cause).     */
 /* ===================================================================== */
+/* delete any existing archive.dat / archiveNNNN.dat in the output dir, so a
+ * reused folder never leaves a stale tail (wrong file length -> "corrupted"). */
+static void clear_output(const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH*2];
+    _snwprintf(path, MAX_PATH*2, L"%s\\archive.dat", dir);
+    DeleteFileW(path);
+    for (int n = 1; n < 100000; n++) {
+        _snwprintf(path, MAX_PATH*2, L"%s\\archive%04d.dat", dir, n);
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) break;
+        DeleteFileW(path);
+    }
+}
+
 /* CBC (+ ciphertext-stealing tail) encrypt, IV=seed (mirror of seal_segment). */
 static void cbc_enc_cts(const aes_ctx *c, const uint8_t seed[16],
                         const uint8_t *pt, uint64_t len, uint8_t *ct)
@@ -1193,6 +1207,7 @@ static int run_clone(const create_job_t *J)
 
     wchar_t *wout = utf8_to_wide(J->outdir[0] ? J->outdir : "clone_out");
     CreateDirectoryW(wout, NULL);
+    clear_output(wout);                  /* remove any stale archive*.dat */
     writer_t w; writer_init(&w, wout);
     printf("[+] clone %s : nseg=%llu keyset=%s%s\n", J->tmpl, (unsigned long long)nseg,
            ck==nkey?"new":"old", g_aesni?"  [AES-NI]":"");
@@ -1278,6 +1293,7 @@ static int run_create(const create_job_t *J)
     wchar_t *wout = utf8_to_wide(J->outdir[0] ? J->outdir : "backup_out");
     if (!wsrc || !wout) { fprintf(stderr,"bad path\n"); return 2; }
     CreateDirectoryW(wout, NULL);
+    clear_output(wout);                  /* remove any stale archive*.dat */
 
     printf("[+] scanning %s%s\n", J->source, g_aesni ? "  [AES-NI]" : "  [SW-AES]");
     vec_t dirs = {0}, files = {0};
