@@ -1681,6 +1681,47 @@ static DWORD WINAPI gui_worker(LPVOID arg)
     return 0;
 }
 
+/* read a template archive.dat and populate Name/Label/User/Host/OpenPSID. */
+static void autofill_from_template(const char *archive_path)
+{
+    if (!archive_path || !archive_path[0]) return;
+    wchar_t tdir[MAX_PATH*2]; dir_of_archive(archive_path, tdir, MAX_PATH*2);
+    detect_aesni();
+
+    /* P4BR header (segment index 1): name @0x34, label @0x80, OpenPSID @0x18 */
+    uint8_t *s0=NULL; uint64_t l0=0;
+    if (caf_read_seg(tdir, 1, &s0, &l0, NULL, NULL)==0 && l0>=0x100) {
+        char name[0x4C]={0}, label[0x80]={0}, ops[33]={0};
+        memcpy(name,  s0+0x34, 0x4A);
+        memcpy(label, s0+0x80, 0x7E);
+        for (int i=0;i<16;i++) sprintf(ops+2*i, "%02x", s0[0x18+i]);
+        if (name[0])  SetWindowTextA(g_name,  name);
+        if (label[0]) SetWindowTextA(g_label, label);
+        SetWindowTextA(g_openpsid, ops);
+    }
+    free(s0);
+
+    /* registry (segment index 4): user name 0x07800200, host 0x02050000 */
+    uint8_t *s3=NULL; uint64_t l3=0;
+    if (caf_read_seg(tdir, 4, &s3, &l3, NULL, NULL)==0 && l3==RG_BLOB) {
+        rg_reg R;
+        if (rg_decode(s3, (uint32_t)l3, &R)==0) {
+            for (int i=0;i<R.n;i++) {
+                rg_entry *e=&R.e[i];
+                if (e->type==0 || !e->val) continue;
+                if (e->v138==RK_USER_NAME || e->v138==RK_HOSTNAME) {
+                    char buf[128]; uint32_t n = e->vlen<127?e->vlen:127;
+                    memcpy(buf, e->val, n); buf[n]=0;
+                    SetWindowTextA(e->v138==RK_USER_NAME ? g_user : g_host, buf);
+                }
+            }
+            rg_free(&R);
+        }
+    }
+    free(s3);
+    SetWindowTextW(g_status, L"Template loaded: fields filled from it. Edit to override, then Create.");
+}
+
 static void start_job(void)
 {
     if (InterlockedExchange(&g_running, 1)) return;
@@ -1734,10 +1775,18 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         }
         case IDC_TMPL_BROWSE: {
             char p[1024];
-            if (browse_file(hw, "Select a template archive.dat (for seg3/aux)", p, sizeof p))
+            if (browse_file(hw, "Select a template archive.dat (for seg3/aux)", p, sizeof p)) {
                 SetWindowTextA(g_tmpl, p);
+                autofill_from_template(p);
+            }
             return 0;
         }
+        case IDC_TMPL_EDIT:
+            if (HIWORD(wp) == EN_KILLFOCUS) {    /* typed/pasted path */
+                char p[1024]; GetWindowTextA(g_tmpl, p, sizeof p);
+                if (p[0]) autofill_from_template(p);
+            }
+            return 0;
         case IDC_GO: start_job(); return 0;
         }
         break;
