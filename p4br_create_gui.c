@@ -1375,6 +1375,25 @@ static int run_create(const create_job_t *J)
     printf("[+] catalog: %d dirs, %d files\n", dirs.n, files.n);
     if (files.n == 0 && dirs.n == 0) { fprintf(stderr,"source is empty\n"); return 1; }
 
+    /* sanity: real backups keep everything under /user or /system_data. If the
+     * source has files elsewhere (e.g. a stray archive.dat), it won't restore. */
+    {
+        int good = 0, stray = 0;
+        for (int i = 0; i < files.n; i++)
+            if (!strncmp(files.v[i].path, "/user/", 6) || !strncmp(files.v[i].path, "/system_data/", 13)) good++;
+            else stray++;
+        if (stray) {
+            fprintf(stderr,
+                "\n[!] WARNING: %d file(s) are NOT under /user or /system_data.\n"
+                "    A PS4 backup only restores files inside those roots.\n"
+                "    Your SOURCE folder must contain 'user' and/or 'system_data' subfolders\n"
+                "    (i.e. the EXTRACTED tree from p4br_extract), NOT a backup's archive.dat.\n"
+                "    e.g.  p4br_extract <backup> -o work   then source = work\n\n", stray);
+            if (good == 0)
+                fprintf(stderr, "[!] NONE of the files are under a valid root -- this backup will not restore.\n\n");
+        }
+    }
+
     uint64_t total_payload = 0;
     for (int i = 0; i < files.n; i++) total_payload += files.v[i].size;
 
