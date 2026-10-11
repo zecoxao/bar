@@ -28,11 +28,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Qt
+      # Qt from aqtinstall on Windows/Linux; from Homebrew on macOS (the aqt
+      # macOS package links the removed AGL framework).
+      - name: Install Qt (Windows/Linux)
+        if: runner.os != 'macOS'
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.1'
           cache: true
+
+      - name: Install Qt (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install qt
+          echo "QT_ROOT_DIR=$(brew --prefix qt)" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix qt)" >> "$GITHUB_ENV"
 
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v6
@@ -71,16 +81,21 @@ jobs:
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          OUTPUT: p4br-qt-${{ matrix.name }}.AppImage
         run: |
           out="dist/bar-${{ matrix.name }}"
           mkdir -p "$out"
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export PATH="$QT_ROOT_DIR/bin:$PATH"
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --executable build/p4br-qt \
             --desktop-file packaging/p4br-qt.desktop \
             --icon-file packaging/p4br-qt.png \
             --plugin qt --output appimage
-          mv p4br-qt*.AppImage "$out/p4br-qt-${{ matrix.name }}.AppImage"
+          cp "$OUTPUT" "$out/"
           cp build/p4br_extract build/p4br_create "$out/"
           cp README.md "$out/"
           tar -czf "bar-${{ matrix.name }}.tar.gz" -C "$out" .
