@@ -918,8 +918,10 @@ static void walk(const wchar_t *base, const char *rel, vec_t *dirs, vec_t *files
         e.atime = ft_to_unix(fd.ftLastAccessTime);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             e.is_dir = 1; e.size = 0; e.mode = 0x41F8;      /* 040770 */
-            vec_push(dirs, e);
-            walk(sub, posix, dirs, files);
+            /* real backups do NOT catalog the top-level roots (/user, /system_data)
+             * as dir records -- only their contents. Skip depth-0 dirs. */
+            if (rel[0]) { vec_push(dirs, e); walk(sub, posix, dirs, files); }
+            else        { walk(sub, posix, dirs, files); free(posix); }
         } else {
             e.is_dir = 0;
             e.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
