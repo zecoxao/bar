@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=p4br
+GenericName=PS4 backup tool
+Comment=Extract and create PS4 USB backups (P4BR / SCECAF)
+Exec=p4br-qt
+Icon=p4br-qt
+Categories=Utility;
+Terminal=false

@@ -1,0 +1,122 @@
+name: release
+
+# Build the Qt GUI + CLI tools for Windows, Linux and macOS and publish a
+# GitHub Release on a version tag (v*). Can also be run by hand from Actions.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: ubuntu-22.04
+            name: linux-x64
+          - os: macos-latest
+            name: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.1'
+          cache: true
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Linux deploy tooling
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 libxcb-cursor0
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy-*.AppImage
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "dist/bar-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item build/p4br-qt.exe      $out
+          Copy-Item build/p4br_extract.exe $out
+          Copy-Item build/p4br_create.exe  $out
+          & "$env:QT_ROOT_DIR/bin/windeployqt.exe" --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$out/p4br-qt.exe"
+          Copy-Item README.md $out
+          Compress-Archive -Path "$out/*" -DestinationPath "bar-${{ matrix.name }}.zip" -Force
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          out="dist/bar-${{ matrix.name }}"
+          mkdir -p "$out"
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable build/p4br-qt \
+            --desktop-file packaging/p4br-qt.desktop \
+            --icon-file packaging/p4br-qt.png \
+            --plugin qt --output appimage
+          mv p4br-qt*.AppImage "$out/p4br-qt-${{ matrix.name }}.AppImage"
+          cp build/p4br_extract build/p4br_create "$out/"
+          cp README.md "$out/"
+          tar -czf "bar-${{ matrix.name }}.tar.gz" -C "$out" .
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          out="dist/bar-${{ matrix.name }}"
+          mkdir -p "$out"
+          "$QT_ROOT_DIR/bin/macdeployqt" build/p4br-qt.app
+          cp -R build/p4br-qt.app "$out/"
+          cp build/p4br_extract build/p4br_create "$out/"
+          cp README.md "$out/"
+          (cd "$out" && zip -ry "../../bar-${{ matrix.name }}.zip" .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bar-${{ matrix.name }}
+          path: |
+            bar-${{ matrix.name }}.zip
+            bar-${{ matrix.name }}.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false

@@ -1,0 +1,8 @@
+*.o
+*.obj
+*.exe
+build/
+dist/
+AppDir/
+*.AppImage
+p4br_skeleton/

@@ -22,11 +22,12 @@ seg6+ file payload, one segment per file, tight-packed in catalog order
 
 | file | what it does |
 |------|--------------|
-| `p4br_extract.c` / `.exe` | CLI extractor (HMAC-verify, `--list`, include/exclude, manifest) |
-| `p4br_extract_gui.c`      | same, Win32 GUI |
-| `p4br_extract.py`         | Python extractor |
-| `p4br_create_gui.c` / `.exe` | **creator** (CLI + GUI): folder → restorable-shaped backup |
-| `seg3_codec.py`           | standalone seg3 **registry** codec (decode + encode) + validator |
+| `p4br_extract.c` | **portable** CLI extractor (Windows/Linux/macOS; HMAC-verify, `--list`, include/exclude, manifest) |
+| `p4br_create.c`  | **portable** CLI creator (folder → restorable-shaped backup; skeleton/template/keyset) |
+| `qt/`            | **cross-platform Qt 6 GUI** (`p4br-qt`) with Extract + Create tabs |
+| `bar_crypto.h` / `bar_platform.h` | shared portable crypto (AES-NI + software fallback) + OS layer |
+| `p4br_extract.py` / `seg3_codec.py` | Python reference extractor + seg3 **registry** codec/validator |
+| `p4br_extract_gui.c` / `p4br_create_gui.c` | original Windows-only Win32 GUIs (superseded by `qt/`) |
 
 ## seg3 = the PS4 system registry
 
@@ -116,14 +117,32 @@ p4br_create ./my_user_tree -o ./out -t /path/CONSOLE/archive.dat \
     --set-user Alice --set-hostname PS4-ALICE
 ```
 
-## Build
+## Build (Windows / Linux / macOS)
+
+The portable CLIs and the Qt 6 GUI build with CMake. Prebuilt archives for all
+three platforms (GUI `p4br-qt` + `p4br_extract` + `p4br_create`) are attached to
+each [release](../../releases).
 
 ```
-# extractor / creator, native Win32 .exe (mingw-w64)
-gcc -O3 -maes -msse4.1 p4br_extract.c     -o p4br_extract.exe
-gcc -O3 -maes -msse4.1 -mwindows p4br_create_gui.c -o p4br_create_gui.exe \
-    -lshell32 -lole32 -luuid -lgdi32 -lcomdlg32
-# (console build: drop -mwindows)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/path/to/Qt/6.x/<kit>
+cmake --build build
+# -> build/p4br_extract, build/p4br_create (CLIs) and build/p4br-qt (GUI)
+```
+
+If Qt 6 is not found, the two CLIs still build. On x86 CMake adds `-maes
+-msse4.1` for the AES-NI path; AES-NI is used only when the CPU advertises it,
+with a pure-software fallback (so the same binary runs on CPUs without it, and
+on ARM / Apple Silicon the intrinsics are compiled out entirely).
+
+The GUI reuses the portable cores unchanged: `qt/extract_bridge.c` and
+`qt/create_bridge.c` compile `p4br_extract.c` / `p4br_create.c` with their
+`*_GUI` macro and expose a small C API (`qt/bar_bridge.h`) to the Qt C++ UI.
+
+### CLI only (no Qt)
+
+```
+cc -O3 p4br_extract.c -o p4br_extract        # add -maes -msse4.1 on x86
+cc -O3 p4br_create.c  -o p4br_create -lpthread
 ```
 
 Python tools need `pycryptodome` (`py -m pip install pycryptodome`), e.g.
