@@ -1243,10 +1243,10 @@ static int run_clone(const create_job_t *J)
                 for (int si=0; si<J->nsets; si++){ char t[160]; strncpy(t,J->sets[si],159); t[159]=0; char *eq=strchr(t,'='); if(!eq)continue; *eq=0; uint32_t kid=(uint32_t)strtoul(t,NULL,16); printf("  [reg] %08x -> \"%s\" (%s)\n",kid,eq+1, rg_set_str(&R,kid,eq+1)?"ok":"absent"); }
                 rg_encode(&R, pt, (uint32_t)nop); rg_free(&R);
             }
-        } else { /* idx==1 P4BR : name@0x34 is the console name (== registry host 0x2050000) */
+        } else { /* idx==1 P4BR : name@0x34 (64B, console name == reg 0x2050000); hw@0x78 must stay! */
             const char *cn = J->name[0] ? J->name : (J->set_host[0] ? J->set_host : NULL);
-            if (cn && strncmp((char*)pt+0x34, cn, 0x4A)) { memset(pt+0x34,0,0x4A); strncpy((char*)pt+0x34, cn, 0x49); printf("  [p4br] name -> %s\n", cn); }
-            if (J->label[0] && strncmp((char*)pt+0x80, J->label, 0x7E)) { memset(pt+0x80,0,0x7E); strncpy((char*)pt+0x80, J->label, 0x7D); printf("  [p4br] label -> %s\n", J->label); }
+            if (cn && strncmp((char*)pt+0x34, cn, 0x40)) { memset(pt+0x34,0,0x40); strncpy((char*)pt+0x34, cn, 0x3F); printf("  [p4br] name -> %s\n", cn); }
+            if (J->label[0] && strncmp((char*)pt+0x80, J->label, 0x78)) { memset(pt+0x80,0,0x78); strncpy((char*)pt+0x80, J->label, 0x77); printf("  [p4br] label -> %s\n", J->label); }
             if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(pt+0x18,o,16); }
         }
         if (memcmp(pt, op, (size_t)nop) != 0) {       /* actually changed: re-encrypt nopad, keep padding */
@@ -1420,13 +1420,13 @@ static int run_create(const create_job_t *J)
         uint32_t nd = (uint32_t)dirs.n, nf = (uint32_t)files.n;
         memcpy(p4 + 0x10, &nd, 4);
         memcpy(p4 + 0x14, &nf, 4);
-        /* console name @0x34 = Name override, else Host (== registry 0x2050000) */
+        /* console name @0x34 (64B field; hw@0x78 / productCode@0x7C MUST be preserved) */
         const char *cn = J->name[0] ? J->name : (J->set_host[0] ? J->set_host : NULL);
-        if (cn)          { memset(p4 + 0x34, 0, 0x4B); strncpy((char*)p4 + 0x34, cn, 0x4A); }
-        else if (!have_aux) strncpy((char*)p4 + 0x34, "PS4", 0x4A);
+        if (cn)          { memset(p4 + 0x34, 0, 0x40); strncpy((char*)p4 + 0x34, cn, 0x3F); }
+        else if (!have_aux) strncpy((char*)p4 + 0x34, "PS4", 0x3F);
         if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(p4+0x18,o,16); }
-        if (J->label[0]) { memset(p4 + 0x80, 0, 0x7F); strncpy((char*)p4 + 0x80, J->label, 0x7E); }
-        else if (!have_aux) strncpy((char*)p4 + 0x80, J->name[0]?J->name:"PS4 backup", 0x7E);
+        if (J->label[0]) { memset(p4 + 0x80, 0, 0x78); strncpy((char*)p4 + 0x80, J->label, 0x77); }
+        else if (!have_aux) strncpy((char*)p4 + 0x80, J->name[0]?J->name:"PS4 backup", 0x77);
         src_t s = { p4, NULL, p4len };
         uint8_t *ib = _aligned_malloc(BUFCAP,16), *ob = _aligned_malloc(BUFCAP,16);
         seal_segment(&w, &ctx, &hbase, &s, &segs[0], ib, ob);
