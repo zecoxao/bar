@@ -1205,6 +1205,110 @@ static int run_make_skeleton(const char *backup, const char *outskel_opt)
     return 0;
 }
 
+/* --------------------------------------------------------------------- *
+ * Auto-extract: if the user points "source" at a PS4 backup (a folder
+ * holding archive.dat, or an archive.dat itself) instead of an extracted
+ * file tree, rebuild that backup's real file tree on disk so the normal
+ * pack path can re-derive the catalog. This stops the classic mistake of
+ * packing the backup's own archive.dat as a single /archive.dat file.
+ * --------------------------------------------------------------------- */
+static void mk_parent_dirs(const wchar_t *full)
+{
+    wchar_t tmp[MAX_PATH*4]; wcsncpy(tmp, full, MAX_PATH*4-1); tmp[MAX_PATH*4-1]=0;
+    for (wchar_t *p = tmp+1; *p; p++)
+        if (*p==L'\\') { *p=0; CreateDirectoryW(tmp, NULL); *p=L'\\'; }
+}
+static void posix_to_full(const wchar_t *root, const char *posix, wchar_t *out, int cap)
+{
+    wchar_t *wp = utf8_to_wide(posix);
+    _snwprintf(out, cap, L"%s%s", root, wp ? wp : L"");
+    free(wp);
+    for (wchar_t *p=out; *p; p++) if (*p==L'/') *p=L'\\';
+}
+static void rmtree(const wchar_t *dir)
+{
+    wchar_t pat[MAX_PATH*4]; _snwprintf(pat, MAX_PATH*4, L"%s\\*", dir);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!wcscmp(fd.cFileName,L".") || !wcscmp(fd.cFileName,L"..")) continue;
+            wchar_t sub[MAX_PATH*4]; _snwprintf(sub, MAX_PATH*4, L"%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { rmtree(sub); RemoveDirectoryW(sub); }
+            else { SetFileAttributesW(sub, FILE_ATTRIBUTE_NORMAL); DeleteFileW(sub); }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+/* is `src` a backup? if so put its folder in bdir_out */
+static int source_is_backup(const char *src, wchar_t *bdir_out, int cap)
+{
+    wchar_t *w = utf8_to_wide(src); if (!w) return 0;
+    DWORD at = GetFileAttributesW(w); free(w);
+    char arcu[MAX_PATH*4];
+    if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY))
+        _snprintf(arcu, sizeof arcu, "%s/archive.dat", src);
+    else { strncpy(arcu, src, sizeof arcu-1); arcu[sizeof arcu-1]=0; }
+    wchar_t bdir[MAX_PATH*2]; dir_of_archive(arcu, bdir, MAX_PATH*2);
+    uint8_t h[0x30];
+    if (caf_pread(bdir, 0, 0x30, h) != 0 || memcmp(h, CAF_MAGIC, 6) != 0) return 0;
+    wcsncpy(bdir_out, bdir, cap-1); bdir_out[cap-1]=0;
+    return 1;
+}
+/* decode a backup's dir/file catalog + payloads into a real on-disk tree */
+static int extract_backup_to_tree(const wchar_t *bdir, const wchar_t *destroot)
+{
+    CreateDirectoryW(destroot, NULL);
+    uint8_t *dcat=NULL,*fcat=NULL; uint64_t dl=0,fl=0;
+    caf_read_seg(bdir, 2, &dcat, &dl, NULL, NULL);                 /* dir  records */
+    if (caf_read_seg(bdir, 3, &fcat, &fl, NULL, NULL) != 0) {
+        fprintf(stderr,"[!] backup source has no file catalog\n"); free(dcat); return 1; }
+    int ndir=0, nfile=0, ok=1;
+    if (dcat) for (uint64_t o=0; o+REC<=dl; o+=REC) {
+        const char *path=(const char*)dcat+o+0x54; if (!path[0]) continue;
+        wchar_t full[MAX_PATH*4]; posix_to_full(destroot, path, full, MAX_PATH*4);
+        mk_parent_dirs(full); CreateDirectoryW(full, NULL); ndir++;
+    }
+    int rec=0;
+    for (uint64_t o=0; o+REC<=fl; o+=REC, rec++) {
+        const char *path=(const char*)fcat+o+0x54;
+        uint64_t sz; memcpy(&sz, fcat+o+0x30, 8);
+        uint8_t *pl=NULL; uint64_t pll=0;
+        int r = caf_read_seg(bdir, 10000+rec, &pl, &pll, NULL, NULL);   /* payload k */
+        if (!path[0]) { if (pl) free(pl); continue; }
+        wchar_t full[MAX_PATH*4]; posix_to_full(destroot, path, full, MAX_PATH*4);
+        mk_parent_dirs(full);
+        HANDLE oh = CreateFileW(full, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (oh == INVALID_HANDLE_VALUE) { fprintf(stderr,"[!] cannot write %ls\n", full); ok=0; if(pl)free(pl); continue; }
+        if (r==0 && pl && pll) { DWORD wr=0; WriteFile(oh, pl, (DWORD)pll, &wr, NULL); }
+        CloseHandle(oh); if (pl) free(pl); nfile++;
+    }
+    free(dcat); free(fcat);
+    printf("[+] extracted backup source: %d dirs, %d files\n", ndir, nfile);
+    return ok?0:1;
+}
+
+/* Reorder a catalog vec to follow the template's exact record order (payloads
+ * track file order, so a re-pack of an unchanged backup reproduces the original
+ * layout). Entries absent from the template (new files) keep walk order last. */
+static void reorder_by_template(vec_t *v, const uint8_t *tcat, uint64_t tlen)
+{
+    if (!tcat || tlen < REC || v->n <= 1) return;
+    int tn = (int)(tlen / REC), k = 0;
+    entry_t *nv = malloc((size_t)v->n * sizeof(entry_t));
+    char *placed = calloc((size_t)v->n, 1);
+    for (int t = 0; t < tn && k < v->n; t++) {
+        const char *tp = (const char *)tcat + (uint64_t)t*REC + 0x54;
+        if (!tp[0]) continue;
+        for (int i = 0; i < v->n; i++)
+            if (!placed[i] && !strcmp(v->v[i].path, tp)) { nv[k++] = v->v[i]; placed[i] = 1; break; }
+    }
+    int matched = k;
+    for (int i = 0; i < v->n; i++) if (!placed[i]) nv[k++] = v->v[i];
+    memcpy(v->v, nv, (size_t)v->n * sizeof(entry_t));
+    free(nv); free(placed);
+    if (matched < v->n) printf("  [order] %d/%d match template order, %d new kept last\n", matched, v->n, v->n - matched);
+}
+
 /* CBC (+ ciphertext-stealing tail) encrypt, IV=seed (mirror of seal_segment). */
 static void cbc_enc_cts(const aes_ctx *c, const uint8_t seed[16],
                         const uint8_t *pt, uint64_t len, uint8_t *ct)
@@ -1369,6 +1473,22 @@ static int run_create(const create_job_t *J)
     CreateDirectoryW(wout, NULL);
     clear_output(wout);                  /* remove any stale archive*.dat */
 
+    /* If the source is itself a PS4 backup (folder with archive.dat, or an
+     * archive.dat), rebuild its real file tree first and pack THAT, instead
+     * of packing the opaque archive.dat as a single bogus /archive.dat. */
+    {
+        wchar_t bdir[MAX_PATH*2];
+        if (source_is_backup(J->source, bdir, MAX_PATH*2)) {
+            wchar_t srctree[MAX_PATH*2];
+            _snwprintf(srctree, MAX_PATH*2, L"%s\\_p4br_srctree", wout);
+            rmtree(srctree); RemoveDirectoryW(srctree);
+            printf("[+] source is a PS4 backup -> extracting its file tree to rebuild from\n");
+            if (extract_backup_to_tree(bdir, srctree) != 0) {
+                fprintf(stderr,"[!] could not extract backup source\n"); return 1; }
+            free(wsrc); wsrc = _wcsdup(srctree);
+        }
+    }
+
     printf("[+] scanning %s%s\n", J->source, g_aesni ? "  [AES-NI]" : "  [SW-AES]");
     vec_t dirs = {0}, files = {0};
     walk(wsrc, "", &dirs, &files);
@@ -1449,6 +1569,11 @@ static int run_create(const create_job_t *J)
                     r3, (unsigned long long)l3, r4, r5, r0);
         }
         if (have_aux) free(s3);   /* s4/s5/s0 kept; s3 already consumed */
+
+        /* emit in the template's catalog order so a re-pack reproduces the
+         * original layout (payloads follow file order). */
+        reorder_by_template(&dirs,  tcat_d, tcat_dl);
+        reorder_by_template(&files, tcat_f, tcat_fl);
     }
 
     /* ---- resolve keyset: --keyset wins, else match the template, else new ----

@@ -68,6 +68,23 @@ In the GUI: click **Make skeleton from a backup…** once, then just pick a
 and stay editable). The output keeps the skeleton console's OpenPSID /
 hardware, so it restores to that console.
 
+### What the Source must be
+
+The **Source** is the **file tree** to back up — a folder holding `user/`
+and/or `system_data/` subfolders. It is **not** a backup folder and **not** an
+`archive.dat`. As a convenience, if you *do* point it at a backup (a folder
+containing `archive.dat`, or an `archive.dat` itself), the tool detects it and
+**auto-extracts that backup's real file tree first**, then rebuilds from it — so
+re-packing a backup reproduces its exact catalog instead of packing one bogus
+`/archive.dat`. To edit files, extract a backup (`p4br_extract <backup> -o work`),
+change files under `work/user/` or `work/system_data/`, then Source = `work`.
+
+Catalog **order** matters: when a template or the bundled skeleton is present,
+dirs/files are emitted in the template's exact catalog order (payloads follow
+file order), and new files you added are appended last. A re-pack of an
+unchanged backup then comes out **plaintext-identical** to the original
+(only the per-segment IVs differ), i.e. structurally a known-good backup.
+
 ### Explicit template / no aux
 
 * **Without `-t` and no skeleton**: packs the folder into a valid SCECAF/P4BR
