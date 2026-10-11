@@ -1226,7 +1226,7 @@ static int run_clone(const create_job_t *J)
         uint64_t idx; memcpy(&idx, r, 8);
         int candidate = nop &&
             ((idx==4 && nop==RG_BLOB && (J->set_user[0]||J->set_host[0]||J->openpsid[0]||J->nsets)) ||
-             (idx==1 && nop>=0x100 && (J->name[0]||J->label[0]||J->openpsid[0])));
+             (idx==1 && nop>=0x100 && (J->name[0]||J->label[0]||J->openpsid[0]||J->set_host[0])));
         if (!candidate) { clone_copy(tdir, &w, off, pad, cbuf); continue; }
 
         /* read the padded region, decrypt, apply edits, and re-seal ONLY if it changed */
@@ -1243,8 +1243,9 @@ static int run_clone(const create_job_t *J)
                 for (int si=0; si<J->nsets; si++){ char t[160]; strncpy(t,J->sets[si],159); t[159]=0; char *eq=strchr(t,'='); if(!eq)continue; *eq=0; uint32_t kid=(uint32_t)strtoul(t,NULL,16); printf("  [reg] %08x -> \"%s\" (%s)\n",kid,eq+1, rg_set_str(&R,kid,eq+1)?"ok":"absent"); }
                 rg_encode(&R, pt, (uint32_t)nop); rg_free(&R);
             }
-        } else { /* idx==1 P4BR */
-            if (J->name[0]  && strncmp((char*)pt+0x34, J->name,  0x4A)) { memset(pt+0x34,0,0x4A); strncpy((char*)pt+0x34, J->name,  0x49); printf("  [p4br] name -> %s\n", J->name); }
+        } else { /* idx==1 P4BR : name@0x34 is the console name (== registry host 0x2050000) */
+            const char *cn = J->name[0] ? J->name : (J->set_host[0] ? J->set_host : NULL);
+            if (cn && strncmp((char*)pt+0x34, cn, 0x4A)) { memset(pt+0x34,0,0x4A); strncpy((char*)pt+0x34, cn, 0x49); printf("  [p4br] name -> %s\n", cn); }
             if (J->label[0] && strncmp((char*)pt+0x80, J->label, 0x7E)) { memset(pt+0x80,0,0x7E); strncpy((char*)pt+0x80, J->label, 0x7D); printf("  [p4br] label -> %s\n", J->label); }
             if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(pt+0x18,o,16); }
         }
@@ -1745,7 +1746,9 @@ static void autofill_from_template(const char *archive_path)
         memcpy(name,  s0+0x34, 0x4A);
         memcpy(label, s0+0x80, 0x7E);
         for (int i=0;i<16;i++) sprintf(ops+2*i, "%02x", s0[0x18+i]);
-        if (name[0])  SetWindowTextA(g_name,  name);
+        /* Name is an optional P4BR-only override; the console name comes from
+         * Host (applied to both P4BR and the registry). Leave Name blank. */
+        SetWindowTextA(g_name, "");
         if (label[0]) SetWindowTextA(g_label, label);
         SetWindowTextA(g_openpsid, ops);
     }
@@ -1898,7 +1901,7 @@ static int gui_run(void)
     mk(L"BUTTON", L"Browse...", 0, 455, 84, 85, 24, g_main, IDC_OUT_BROWSE);
 
     mk(L"STATIC", L"Name:", 0, 15, 120, 45, 18, g_main, 0);
-    g_name = mk(L"EDIT", L"PS4", WS_BORDER | ES_AUTOHSCROLL, 60, 117, 150, 24, g_main, IDC_NAME);
+    g_name = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 60, 117, 150, 24, g_main, IDC_NAME);
     mk(L"STATIC", L"Label:", 0, 225, 120, 45, 18, g_main, 0);
     g_label = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 275, 117, 265, 24, g_main, IDC_LABEL);
 
