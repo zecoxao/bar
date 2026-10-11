@@ -1420,8 +1420,11 @@ static int run_create(const create_job_t *J)
         uint32_t nd = (uint32_t)dirs.n, nf = (uint32_t)files.n;
         memcpy(p4 + 0x10, &nd, 4);
         memcpy(p4 + 0x14, &nf, 4);
-        if (J->name[0])  { memset(p4 + 0x34, 0, 0x4B); strncpy((char*)p4 + 0x34, J->name, 0x4A); }
+        /* console name @0x34 = Name override, else Host (== registry 0x2050000) */
+        const char *cn = J->name[0] ? J->name : (J->set_host[0] ? J->set_host : NULL);
+        if (cn)          { memset(p4 + 0x34, 0, 0x4B); strncpy((char*)p4 + 0x34, cn, 0x4A); }
         else if (!have_aux) strncpy((char*)p4 + 0x34, "PS4", 0x4A);
+        if (J->openpsid[0] && strlen(J->openpsid)==32) { uint8_t o[16]; if(hex2bin(J->openpsid,o,16)==0) memcpy(p4+0x18,o,16); }
         if (J->label[0]) { memset(p4 + 0x80, 0, 0x7F); strncpy((char*)p4 + 0x80, J->label, 0x7E); }
         else if (!have_aux) strncpy((char*)p4 + 0x80, J->name[0]?J->name:"PS4 backup", 0x7E);
         src_t s = { p4, NULL, p4len };
